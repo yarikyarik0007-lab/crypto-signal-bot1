@@ -500,6 +500,23 @@ def summarize_trades(trades: list[dict]) -> dict | None:
     }
 
 
+def _record_signal(coin: str, signal: dict):
+    if signal.get("status") not in ("LONG", "SHORT"): return
+    signal_id = signal.get("signal_id")
+    if not signal_id or _LAST_SIGNAL_KEY.get(coin) == signal_id: return
+    _LAST_SIGNAL_KEY[coin] = signal_id
+    _SIGNAL_HISTORY.insert(0, {"coin": coin, "direction": signal["status"], "score": signal.get("score", 0), "entry": signal.get("entry"), "sl": signal.get("sl"), "tp": signal.get("tp"), "created_at": time.time(), "outcome": "OPEN", "result_r": None, "closed_at": None})
+    del _SIGNAL_HISTORY[MAX_SIGNAL_HISTORY:]
+
+def _update_signal_outcomes(coin: str, candles: list[dict]):
+    if not candles: return
+    current = candles[-1]
+    for item in [x for x in _SIGNAL_HISTORY if x["coin"] == coin and x["outcome"] == "OPEN"]:
+        if item["direction"] == "LONG": hit_sl, hit_tp = current["l"] <= item["sl"], current["h"] >= item["tp"]
+        else: hit_sl, hit_tp = current["h"] >= item["sl"], current["l"] <= item["tp"]
+        if hit_sl: item["outcome"], item["result_r"], item["closed_at"] = "LOSS", -1.05, time.time()
+        elif hit_tp: item["outcome"], item["result_r"], item["closed_at"] = "WIN", 1.95, time.time()
+
 async def refresh_all_market_data():
     results = await asyncio.gather(*(fetch_coin_data(c) for c in COINS), return_exceptions=True)
     for coin, result in zip(COINS, results):
@@ -507,14 +524,9 @@ async def refresh_all_market_data():
             logging.warning(f"Failed to refresh {coin}: {result}")
             continue
         _MARKET_CACHE[coin] = result
-        signal = result.get("signal", {})
-        if signal.get("status") in ("LONG", "SHORT"):
-            signal_id = signal.get("signal_id")
-            if signal_id and _LAST_SIGNAL_KEY.get(coin) != signal_id:
-                _LAST_SIGNAL_KEY[coin] = signal_id
-                _SIGNAL_HISTORY.insert(0, {"coin": coin, "direction": signal["status"], "score": signal.get("score", 0), "entry": signal.get("entry"), "sl": signal.get("sl"), "tp": signal.get("tp"), "created_at": time.time()})
-                del _SIGNAL_HISTORY[MAX_SIGNAL_HISTORY:]
-
+        _record_signal(coin, result.get("signal", {}))
+        klines = await _get_json(f"{BINGX_BASE}/openApi/swap/v2/quote/klines", {"symbol": BINGX_SYMBOL[coin], "interval": "4h", "limit": 100})
+        _update_signal_outcomes(coin, _parse_klines(klines) if klines else [])
 async def market_data_loop():
     while True:
         await refresh_all_market_data()
@@ -552,29 +564,22 @@ def render_main_menu(states: dict) -> str:
 
 
 def render_coin_card(state: dict) -> str:
-    coin = state["coin"]
-    status = state["status"]
+    coin = state["coin"]; status = state["status"]
     lines = [f"🪙 <b>{coin}</b> · {STATUS_EMOJI[status]}", DATA_NOTE, ""]
-
     if not state.get("ok"):
         lines.append("⏳ Не удалось получить данные с BingX, попробуйте «Обновить».")
         return "\n".join(lines)
-
     change = state["change_24h"]
     change_str = f"{change:+.2f}%" if change is not None else "н/д"
-    lines += [
-        f"💰 ${state['price']:,.2f}".replace(",", " "),
-        f"📊 24ч: {change_str}",
-        f"📈 Тренд: {state['trend']}",
-        "",
-        "Подробный технический анализ — кнопка «Детали».",
-        "",
-        "Вход, стоп, тейк и балл появятся, когда будет готова",
-        "система оценки сигналов (этапы V0.5–V0.8).",
-    ]
+    lines += [f"💰 ${state['price']:,.2f}".replace(",", " "), f"📊 24ч: {change_str}", f"📈 Тренд: {state['trend']}", ""]
+    signal = state.get("signal", {})
+    if status in ("LONG", "SHORT"):
+        lines += [f"🎯 <b>{status}</b> · {signal.get('score', 0)}/8", f"Вход: ${signal['entry']:,.6f}".replace(",", " "), f"SL: ${signal['sl']:,.6f}".replace(",", " "), f"TP: ${signal['tp']:,.6f}".replace(",", " "), "RR: 1:2", f"Почему: {signal.get('reason', 'фильтр условий')}"]
+    elif status == "WAIT":
+        lines += [f"⏳ <b>Сетап формируется</b> · {signal.get('score', 0)}/8", "Сигнал появится только после прохождения полного фильтра."]
+    else:
+        lines += ["⏳ Сейчас качественного входа нет.", "", "Подробный технический анализ — кнопка «Детали»."]
     return "\n".join(lines)
-
-
 def render_details(state: dict) -> str:
     coin = state["coin"]
     if not state.get("ok"):
@@ -654,19 +659,27 @@ def render_news_placeholder() -> str:
 
 
 def render_stats_placeholder() -> str:
-    if not _SIGNAL_HISTORY:
-        return "📊 <b>Статистика</b>\n\nПодтверждённых сигналов пока нет."
-    total = len(_SIGNAL_HISTORY)
-    longs = sum(1 for x in _SIGNAL_HISTORY if x["direction"] == "LONG")
-    shorts = total - longs
+    if not _SIGNAL_HISTORY: return "📊 <b>Статистика</b>\n\nПодтверждённых сигналов пока нет."
+    total = len(_SIGNAL_HISTORY); closed = [x for x in _SIGNAL_HISTORY if x["outcome"] != "OPEN"]
+    wins = [x for x in closed if x["outcome"] == "WIN"]; losses = [x for x in closed if x["outcome"] == "LOSS"]
+    longs = sum(1 for x in _SIGNAL_HISTORY if x["direction"] == "LONG"); shorts = total - longs
     avg_score = sum(x["score"] for x in _SIGNAL_HISTORY) / total
-    lines = ["📊 <b>Статистика сигналов</b>", "", f"Последние: <b>{total}</b> / 20", f"LONG: {longs} · SHORT: {shorts}", f"Средний балл: {avg_score:.1f}/8", "", "<b>Последние сигналы</b>"]
+    total_r = sum(x["result_r"] for x in closed if x["result_r"] is not None)
+    gross_win = sum(x["result_r"] for x in wins if x["result_r"] is not None); gross_loss = abs(sum(x["result_r"] for x in losses if x["result_r"] is not None))
+    pf = gross_win / gross_loss if gross_loss else None
+    max_win = max_loss = cur_win = cur_loss = 0
+    for item in reversed(closed):
+        if item["outcome"] == "WIN": cur_win += 1; cur_loss = 0; max_win = max(max_win, cur_win)
+        else: cur_loss += 1; cur_win = 0; max_loss = max(max_loss, cur_loss)
+    lines = ["📊 <b>Статистика сигналов</b>", "", f"Последние: <b>{total}</b> / 20", f"LONG: {longs} · SHORT: {shorts}", f"Закрыто: {len(closed)} · Открыто: {total-len(closed)}", f"Средний балл: {avg_score:.1f}/8"]
+    if closed: lines += ["", f"Win Rate: <b>{len(wins)/len(closed)*100:.1f}%</b>", f"Результат: <b>{total_r:+.2f}R</b>", f"Profit Factor: {pf:.2f}" if pf is not None else "Profit Factor: ∞", f"Серия побед: {max_win} · серия убытков: {max_loss}"]
+    lines += ["", "<b>Последние сигналы</b>"]
     for item in _SIGNAL_HISTORY[:20]:
-        ts = time.strftime("%d.%m %H:%M", time.localtime(item["created_at"]))
-        lines.append(f"{ts} · {item['coin']} · {STATUS_EMOJI[item['direction']]} {item['direction']} · {item['score']}/8")
-    lines += ["", "Win Rate и P/L появятся после добавления автоматического контроля SL/TP."]
+        ts = time.strftime("%d.%m %H:%M", time.localtime(item["created_at"])); outcome = {"OPEN":"🟡","WIN":"✅","LOSS":"❌"}[item["outcome"]]
+        result = f" · {item['result_r']:+.2f}R" if item["result_r"] is not None else ""
+        lines.append(f"{ts} · {item['coin']} · {STATUS_EMOJI[item['direction']]} {item['direction']} · {item['score']}/8 · {outcome}{result}")
+    lines += ["", "⚠️ Исход определяется по фактическим свечам BingX. Если SL и TP достигнуты в одной свече, учитывается SL.", "История хранится в памяти процесса и сбрасывается при перезапуске."]
     return "\n".join(lines)
-
 def main_menu_keyboard(states: dict) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for coin in COINS:
@@ -743,6 +756,9 @@ async def cb_coin_card(callback: CallbackQuery):
     await callback.answer("Обновляю…")
     state = await fetch_coin_data(coin)
     _MARKET_CACHE[coin] = state
+    _record_signal(coin, state.get("signal", {}))
+    klines = await _get_json(f"{BINGX_BASE}/openApi/swap/v2/quote/klines", {"symbol": BINGX_SYMBOL[coin], "interval": "4h", "limit": 100})
+    _update_signal_outcomes(coin, _parse_klines(klines) if klines else [])
     await callback.message.edit_text(render_coin_card(state), reply_markup=coin_card_keyboard(coin))
 
 
