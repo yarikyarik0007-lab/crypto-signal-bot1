@@ -64,7 +64,8 @@ def _parse_klines(payload: dict) -> list[dict]:
                                  float(item[3]), float(item[4]), float(item[5]))
             else:
                 continue
-            candles.append({"o": o, "h": h, "l": l, "c": c, "v": v})
+            t = int(item.get("time", 0) or 0) if isinstance(item, dict) else 0
+            candles.append({"t": t, "o": o, "h": h, "l": l, "c": c, "v": v})
         except (TypeError, ValueError):
             continue
     return candles
@@ -237,7 +238,7 @@ def evaluate_live_signal(coin: str, candles: list[dict]) -> dict:
         risk = entry - sl
         if risk <= 0:
             return {"status": "NONE"}
-        return {"status": "LONG", "score": score_long, "entry": entry, "sl": sl, "tp": entry + risk * 2, "risk_pct": round(risk / entry * 100, 2), "reason": ", ".join(long_reasons), "signal_id": f"{coin}:LONG:{signal_candle['c']:.10f}"}
+        return {"status": "LONG", "score": score_long, "entry": entry, "sl": sl, "tp": entry + risk * 2, "risk_pct": round(risk / entry * 100, 2), "reason": ", ".join(long_reasons), "signal_time": signal_candle.get("t", 0), "signal_id": f"{coin}:LONG:{signal_candle.get('t', 0)}:{signal_candle['c']:.10f}"}
 
     if score_short >= SIGNAL_MIN_SCORE and score_short > score_long:
         entry = signal_candle["c"]
@@ -245,7 +246,7 @@ def evaluate_live_signal(coin: str, candles: list[dict]) -> dict:
         risk = sl - entry
         if risk <= 0:
             return {"status": "NONE"}
-        return {"status": "SHORT", "score": score_short, "entry": entry, "sl": sl, "tp": entry - risk * 2, "risk_pct": round(risk / entry * 100, 2), "reason": ", ".join(short_reasons), "signal_id": f"{coin}:SHORT:{signal_candle['c']:.10f}"}
+        return {"status": "SHORT", "score": score_short, "entry": entry, "sl": sl, "tp": entry - risk * 2, "risk_pct": round(risk / entry * 100, 2), "reason": ", ".join(short_reasons), "signal_time": signal_candle.get("t", 0), "signal_id": f"{coin}:SHORT:{signal_candle.get('t', 0)}:{signal_candle['c']:.10f}"}
 
     if max(score_long, score_short) >= 3:
         return {"status": "WAIT", "score": max(score_long, score_short)}
@@ -505,17 +506,26 @@ def _record_signal(coin: str, signal: dict):
     signal_id = signal.get("signal_id")
     if not signal_id or _LAST_SIGNAL_KEY.get(coin) == signal_id: return
     _LAST_SIGNAL_KEY[coin] = signal_id
-    _SIGNAL_HISTORY.insert(0, {"coin": coin, "direction": signal["status"], "score": signal.get("score", 0), "entry": signal.get("entry"), "sl": signal.get("sl"), "tp": signal.get("tp"), "created_at": time.time(), "outcome": "OPEN", "result_r": None, "closed_at": None})
+    _SIGNAL_HISTORY.insert(0, {"coin": coin, "direction": signal["status"], "score": signal.get("score", 0), "entry": signal.get("entry"), "sl": signal.get("sl"), "tp": signal.get("tp"), "signal_time": signal.get("signal_time", 0), "created_at": time.time(), "outcome": "OPEN", "result_r": None, "closed_at": None})
     del _SIGNAL_HISTORY[MAX_SIGNAL_HISTORY:]
 
 def _update_signal_outcomes(coin: str, candles: list[dict]):
-    if not candles: return
-    current = candles[-1]
+    if len(candles) < 3: return
+    closed = candles[:-1]
     for item in [x for x in _SIGNAL_HISTORY if x["coin"] == coin and x["outcome"] == "OPEN"]:
-        if item["direction"] == "LONG": hit_sl, hit_tp = current["l"] <= item["sl"], current["h"] >= item["tp"]
-        else: hit_sl, hit_tp = current["h"] >= item["sl"], current["l"] <= item["tp"]
-        if hit_sl: item["outcome"], item["result_r"], item["closed_at"] = "LOSS", -1.05, time.time()
-        elif hit_tp: item["outcome"], item["result_r"], item["closed_at"] = "WIN", 1.95, time.time()
+        signal_time = item.get("signal_time", 0)
+        future = [c for c in closed if c.get("t", 0) > signal_time]
+        for candle in future:
+            if item["direction"] == "LONG":
+                hit_sl, hit_tp = candle["l"] <= item["sl"], candle["h"] >= item["tp"]
+            else:
+                hit_sl, hit_tp = candle["h"] >= item["sl"], candle["l"] <= item["tp"]
+            if hit_sl:
+                item["outcome"], item["result_r"], item["closed_at"] = "LOSS", -1.05, time.time()
+                break
+            if hit_tp:
+                item["outcome"], item["result_r"], item["closed_at"] = "WIN", 1.95, time.time()
+                break
 
 async def refresh_all_market_data():
     results = await asyncio.gather(*(fetch_coin_data(c) for c in COINS), return_exceptions=True)
