@@ -237,7 +237,7 @@ def evaluate_live_signal(coin: str, candles: list[dict]) -> dict:
         risk = entry - sl
         if risk <= 0:
             return {"status": "NONE"}
-        return {"status": "LONG", "score": score_long, "entry": entry, "sl": sl, "tp": entry + risk * 2, "risk_pct": round(risk / entry * 100, 2), "reason": ", ".join(long_reasons), "signal_id": f"{coin}:LONG:{signal_candle[\"c\"]:.10f}"}
+        return {"status": "LONG", "score": score_long, "entry": entry, "sl": sl, "tp": entry + risk * 2, "risk_pct": round(risk / entry * 100, 2), "reason": ", ".join(long_reasons), "signal_id": f"{coin}:LONG:{signal_candle['c']:.10f}"}
 
     if score_short >= SIGNAL_MIN_SCORE and score_short > score_long:
         entry = signal_candle["c"]
@@ -245,7 +245,7 @@ def evaluate_live_signal(coin: str, candles: list[dict]) -> dict:
         risk = sl - entry
         if risk <= 0:
             return {"status": "NONE"}
-        return {"status": "SHORT", "score": score_short, "entry": entry, "sl": sl, "tp": entry - risk * 2, "risk_pct": round(risk / entry * 100, 2), "reason": ", ".join(short_reasons), "signal_id": f"{coin}:SHORT:{signal_candle[\"c\"]:.10f}"}
+        return {"status": "SHORT", "score": score_short, "entry": entry, "sl": sl, "tp": entry - risk * 2, "risk_pct": round(risk / entry * 100, 2), "reason": ", ".join(short_reasons), "signal_id": f"{coin}:SHORT:{signal_candle['c']:.10f}"}
 
     if max(score_long, score_short) >= 3:
         return {"status": "WAIT", "score": max(score_long, score_short)}
