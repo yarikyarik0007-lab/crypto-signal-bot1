@@ -336,139 +336,84 @@ async def fetch_historical_klines(symbol: str, interval: str = "4h", target: int
     return all_candles[-target:] if len(all_candles) > target else all_candles
 
 
-BT_ZONE_LOOKBACK = 40
-BT_PIVOT_WINDOW = 2
 BT_RR_TARGET = 2.0
 BT_FEE_R = 0.05
-BT_BREAKOUT_MARGIN = 0.005
-BT_RETEST_TOLERANCE = 0.006
-BT_RETEST_WINDOW = 8
+BT_MAX_BARS_IN_TRADE = 60
 
 
-def find_pivot_level(candles: list[dict], end_idx: int, lookback: int, side: str,
-                      pivot_window: int = BT_PIVOT_WINDOW) -> float | None:
-    """Самый значимый пивот в окне (максимальный максимум / минимальный минимум
-    среди всех подтверждённых локальных экстремумов), а не просто ближайший —
-    иначе случайный мелкий пивот прямо перед пробоем перебивает настоящий уровень."""
-    start = max(end_idx - lookback, pivot_window)
-    pivots = []
-    for idx in range(start, end_idx - 2):
-        lo, hi = idx - pivot_window, idx + pivot_window + 1
-        if lo < 0 or hi > len(candles):
-            continue
-        segment = candles[lo:hi]
-        center = candles[idx]
-        if side == "low":
-            if center["l"] == min(c["l"] for c in segment):
-                pivots.append(center["l"])
-        else:
-            if center["h"] == max(c["h"] for c in segment):
-                pivots.append(center["h"])
-    if not pivots:
-        return None
-    return max(pivots) if side == "high" else min(pivots)
+def run_backtest(candles: list[dict], rr_target=BT_RR_TARGET,
+                 fee_r=BT_FEE_R, max_bars_in_trade=BT_MAX_BARS_IN_TRADE) -> list[dict]:
+    """Backtest the exact same signal engine used by live trading.
 
-
-def run_backtest(candles: list[dict], zone_lookback=BT_ZONE_LOOKBACK, rr_target=BT_RR_TARGET,
-                  fee_r=BT_FEE_R, breakout_margin=BT_BREAKOUT_MARGIN,
-                  retest_tolerance=BT_RETEST_TOLERANCE, retest_window=BT_RETEST_WINDOW) -> list[dict]:
-    """Стратегия: пробой значимого уровня (с объёмом) + ретест этого уровня с
-    подтверждающей свечой в сторону пробоя. Цель 2R."""
+    Each historical signal is evaluated only with candles available at that
+    moment. The signal candle is closed; entry is its close. The following
+    candles determine whether SL or TP is reached. If both are touched in the
+    same candle, SL wins conservatively.
+    """
     n = len(candles)
     trades = []
-    pending: list[dict] = []
-    i = zone_lookback + BT_PIVOT_WINDOW + 2
+    i = 60
 
     while i < n - 1:
-        sig = candles[i]
-
-        pending = [p for p in pending if i - p["breakout_i"] <= retest_window]
-
-        triggered = None
-        for p in pending:
-            if p["dir"] == "LONG":
-                retest_touch = sig["l"] <= p["level"] * (1 + retest_tolerance)
-                holds = sig["c"] > p["level"]
-                bullish = sig["c"] > sig["o"]
-                if retest_touch and holds and bullish:
-                    triggered = p
-                    break
-            else:
-                retest_touch = sig["h"] >= p["level"] * (1 - retest_tolerance)
-                holds = sig["c"] < p["level"]
-                bearish = sig["c"] < sig["o"]
-                if retest_touch and holds and bearish:
-                    triggered = p
-                    break
-
-        if triggered:
-            pending = [p for p in pending if p is not triggered]
-            direction = triggered["dir"]
-            level = triggered["level"]
-
-            if i + 1 >= n:
-                break
-            entry = candles[i + 1]["o"]
-
-            if direction == "LONG":
-                sl = min(level * (1 - 0.005), sig["l"] * 0.998)
-                risk = entry - sl
-            else:
-                sl = max(level * (1 + 0.005), sig["h"] * 1.002)
-                risk = sl - entry
-
-            if risk <= 0:
-                i += 1
-                continue
-
-            tp = entry + rr_target * risk if direction == "LONG" else entry - rr_target * risk
-
-            exit_r, exit_i = None, None
-            for k in range(i + 1, n):
-                c = candles[k]
-                if direction == "LONG":
-                    hit_sl, hit_tp = c["l"] <= sl, c["h"] >= tp
-                else:
-                    hit_sl, hit_tp = c["h"] >= sl, c["l"] <= tp
-                if hit_sl:
-                    exit_r, exit_i = -1.0, k
-                    break
-                if hit_tp:
-                    exit_r, exit_i = rr_target, k
-                    break
-
-            if exit_r is None:
-                last = candles[-1]["c"]
-                exit_r = (last - entry) / risk if direction == "LONG" else (entry - last) / risk
-                exit_i = n - 1
-
-            exit_r -= fee_r
-            trades.append({"dir": direction, "entry_i": i + 1, "exit_i": exit_i, "r": round(exit_r, 2)})
-            pending = []
-            i = exit_i + 1
+        # We need one candle after i so evaluate_live_signal can treat i as
+        # the latest closed candle and i+1 as the still-forming candle.
+        window = candles[:i + 2]
+        signal = evaluate_live_signal("BACKTEST", window)
+        if signal.get("status") not in ("LONG", "SHORT"):
+            i += 1
             continue
 
-        resistance = find_pivot_level(candles, i, zone_lookback, "high")
-        support = find_pivot_level(candles, i, zone_lookback, "low")
+        direction = signal["status"]
+        entry = signal["entry"]
+        sl = signal["sl"]
+        tp = entry + (entry - sl) * rr_target if direction == "LONG" else entry - (sl - entry) * rr_target
+        risk = abs(entry - sl)
+        if risk <= 0:
+            i += 1
+            continue
 
-        recent_vol = [c["v"] for c in candles[max(0, i - 10):i]]
-        avg_vol = sum(recent_vol) / len(recent_vol) if recent_vol else 0
-        vol_ok = avg_vol == 0 or sig["v"] >= avg_vol
+        exit_r = None
+        exit_i = None
+        end_i = min(n, i + 1 + max_bars_in_trade)
+        for k in range(i + 1, end_i):
+            c = candles[k]
+            if direction == "LONG":
+                hit_sl = c["l"] <= sl
+                hit_tp = c["h"] >= tp
+            else:
+                hit_sl = c["h"] >= sl
+                hit_tp = c["l"] <= tp
 
-        if resistance and sig["c"] > resistance * (1 + breakout_margin) and vol_ok:
-            already_pending = any(p["dir"] == "LONG" and p["level"] == resistance for p in pending)
-            if not already_pending:
-                pending.append({"level": resistance, "dir": "LONG", "breakout_i": i})
+            if hit_sl:
+                exit_r, exit_i = -1.0, k
+                break
+            if hit_tp:
+                exit_r, exit_i = rr_target, k
+                break
 
-        if support and sig["c"] < support * (1 - breakout_margin) and vol_ok:
-            already_pending = any(p["dir"] == "SHORT" and p["level"] == support for p in pending)
-            if not already_pending:
-                pending.append({"level": support, "dir": "SHORT", "breakout_i": i})
+        if exit_r is None:
+            # Expire the trade at the last available candle in the test
+            # window. This avoids carrying an old position indefinitely.
+            k = end_i - 1
+            last = candles[k]["c"]
+            exit_r = ((last - entry) / risk if direction == "LONG"
+                      else (entry - last) / risk)
+            exit_i = k
 
-        i += 1
+        exit_r -= fee_r
+        trades.append({
+            "dir": direction,
+            "signal_i": i,
+            "entry_i": i,
+            "exit_i": exit_i,
+            "score": signal.get("score", 0),
+            "r": round(exit_r, 2),
+        })
+
+        # One position per coin at a time, matching the intended live model.
+        i = exit_i + 1
 
     return trades
-
 
 def summarize_trades(trades: list[dict]) -> dict | None:
     if not trades:
