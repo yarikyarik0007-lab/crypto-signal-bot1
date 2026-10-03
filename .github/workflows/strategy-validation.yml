@@ -1,0 +1,21 @@
+name: Strategy validation
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "bot.py"
+      - "tools/validate_strategy.py"
+      - ".github/workflows/strategy-validation.yml"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python tools/validate_strategy.py
