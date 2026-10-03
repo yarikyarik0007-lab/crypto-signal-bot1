@@ -24,7 +24,12 @@ STATUS_EMOJI = {
     "WAIT": "🟡", "LONG": "🟢", "SHORT": "🔴",
 }
 
-DATA_NOTE = "📡 <i>Реальные данные BingX · вход и балл появятся позже</i>"
+DATA_NOTE = "📡 <i>Реальные данные BingX Futures · таймфрейм 4ч</i>"
+
+MAX_SIGNAL_HISTORY = 20
+SIGNAL_MIN_SCORE = 5
+_SIGNAL_HISTORY: list[dict] = []
+_LAST_SIGNAL_KEY: dict[str, str] = {}
 
 _MARKET_CACHE: dict[str, dict] = {}
 _SESSION: aiohttp.ClientSession | None = None
@@ -167,9 +172,87 @@ def describe_volume(volumes: list[float]) -> str:
     return "Средний"
 
 
+def evaluate_live_signal(coin: str, candles: list[dict]) -> dict:
+    """V1: conservative signal filter using only the last closed 4h candle."""
+    if len(candles) < 60:
+        return {"status": "NONE"}
+
+    closed = candles[:-1]
+    signal_candle = closed[-1]
+    closes = [x["c"] for x in closed]
+    volumes = [x["v"] for x in closed]
+    ema20 = _ema_last(closes, 20)
+    ema50 = _ema_last(closes, 50)
+    rsi = compute_rsi(closes)
+    macd = compute_macd(closes)
+    atr = compute_atr(closed)
+    if not all([ema20, ema50, rsi, macd, atr]):
+        return {"status": "NONE"}
+
+    resistance = max(x["h"] for x in closed[-32:-1])
+    support = min(x["l"] for x in closed[-32:-1])
+    avg_volume = sum(volumes[-21:-1]) / 20
+    volume_ok = avg_volume > 0 and signal_candle["v"] >= avg_volume * 1.15
+    bullish = signal_candle["c"] > signal_candle["o"]
+    bearish = signal_candle["c"] < signal_candle["o"]
+    score_long = 0
+    score_short = 0
+    long_reasons = []
+    short_reasons = []
+
+    if signal_candle["c"] > ema20 > ema50:
+        score_long += 2
+        long_reasons.append("EMA")
+    if signal_candle["c"] < ema20 < ema50:
+        score_short += 2
+        short_reasons.append("EMA")
+    if 52 <= rsi <= 68:
+        score_long += 1
+        long_reasons.append("RSI")
+    if 32 <= rsi <= 48:
+        score_short += 1
+        short_reasons.append("RSI")
+    if macd["hist"] > 0:
+        score_long += 1
+        long_reasons.append("MACD")
+    if macd["hist"] < 0:
+        score_short += 1
+        short_reasons.append("MACD")
+    if volume_ok and bullish:
+        score_long += 1
+        long_reasons.append("Volume")
+    if volume_ok and bearish:
+        score_short += 1
+        short_reasons.append("Volume")
+    if signal_candle["c"] > resistance * 1.003 and bullish:
+        score_long += 2
+        long_reasons.append("Breakout")
+    if signal_candle["c"] < support * 0.997 and bearish:
+        score_short += 2
+        short_reasons.append("Breakout")
+
+    if score_long >= SIGNAL_MIN_SCORE and score_long > score_short:
+        entry = signal_candle["c"]
+        sl = min(resistance * 0.994, entry - atr * 1.15)
+        risk = entry - sl
+        if risk <= 0:
+            return {"status": "NONE"}
+        return {"status": "LONG", "score": score_long, "entry": entry, "sl": sl, "tp": entry + risk * 2, "risk_pct": round(risk / entry * 100, 2), "reason": ", ".join(long_reasons), "signal_id": f"{coin}:LONG:{signal_candle[\"c\"]:.10f}"}
+
+    if score_short >= SIGNAL_MIN_SCORE and score_short > score_long:
+        entry = signal_candle["c"]
+        sl = max(support * 1.006, entry + atr * 1.15)
+        risk = sl - entry
+        if risk <= 0:
+            return {"status": "NONE"}
+        return {"status": "SHORT", "score": score_short, "entry": entry, "sl": sl, "tp": entry - risk * 2, "risk_pct": round(risk / entry * 100, 2), "reason": ", ".join(short_reasons), "signal_id": f"{coin}:SHORT:{signal_candle[\"c\"]:.10f}"}
+
+    if max(score_long, score_short) >= 3:
+        return {"status": "WAIT", "score": max(score_long, score_short)}
+    return {"status": "NONE"}
+
 async def fetch_coin_data(coin: str) -> dict:
     symbol = BINGX_SYMBOL[coin]
-
     klines = await _get_json(
         f"{BINGX_BASE}/openApi/swap/v2/quote/klines",
         {"symbol": symbol, "interval": "4h", "limit": 100},
@@ -177,11 +260,8 @@ async def fetch_coin_data(coin: str) -> dict:
     candles = _parse_klines(klines) if klines else []
     closes = [c["c"] for c in candles]
     volumes = [c["v"] for c in candles]
-
     price = closes[-1] if closes else None
-    change_24h = None
-    if len(closes) >= 7 and closes[-7]:
-        change_24h = round((closes[-1] - closes[-7]) / closes[-7] * 100, 2)
+    change_24h = round((closes[-1] - closes[-7]) / closes[-7] * 100, 2) if len(closes) >= 7 and closes[-7] else None
 
     trend = "Недостаточно данных"
     sma20, sma50 = _sma(closes, 20), _sma(closes, 50)
@@ -194,9 +274,7 @@ async def fetch_coin_data(coin: str) -> dict:
             trend = "Боковой"
 
     if price is None:
-        price_payload = await _get_json(
-            f"{BINGX_BASE}/openApi/swap/v2/quote/price", {"symbol": symbol}
-        )
+        price_payload = await _get_json(f"{BINGX_BASE}/openApi/swap/v2/quote/price", {"symbol": symbol})
         try:
             price = float(price_payload["data"]["price"])
         except (TypeError, KeyError, ValueError):
@@ -207,24 +285,8 @@ async def fetch_coin_data(coin: str) -> dict:
     atr = compute_atr(candles)
     ema20 = _ema_last(closes, 20)
     ema50 = _ema_last(closes, 50)
-
-    return {
-        "coin": coin,
-        "status": "NONE",
-        "price": price,
-        "change_24h": change_24h,
-        "trend": trend,
-        "rsi": rsi,
-        "macd_desc": describe_macd(macd),
-        "macd_hist": macd["hist"] if macd else None,
-        "ema_desc": describe_ema(price, ema20, ema50) if price else "Недостаточно данных",
-        "atr": atr,
-        "atr_pct": round(atr / price * 100, 2) if atr and price else None,
-        "volume_desc": describe_volume(volumes),
-        "updated_at": time.time(),
-        "ok": price is not None,
-    }
-
+    signal = evaluate_live_signal(coin, candles)
+    return {"coin": coin, "status": signal.get("status", "NONE"), "signal": signal, "price": price, "change_24h": change_24h, "trend": trend, "rsi": rsi, "macd_desc": describe_macd(macd), "macd_hist": macd["hist"] if macd else None, "ema_desc": describe_ema(price, ema20, ema50) if price else "Недостаточно данных", "atr": atr, "atr_pct": round(atr / price * 100, 2) if atr and price else None, "volume_desc": describe_volume(volumes), "updated_at": time.time(), "ok": price is not None}
 
 async def fetch_historical_klines(symbol: str, interval: str = "4h", target: int = 1000) -> list[dict]:
     """Постранично скачивает длинную историю свечей у BingX."""
@@ -445,7 +507,13 @@ async def refresh_all_market_data():
             logging.warning(f"Failed to refresh {coin}: {result}")
             continue
         _MARKET_CACHE[coin] = result
-
+        signal = result.get("signal", {})
+        if signal.get("status") in ("LONG", "SHORT"):
+            signal_id = signal.get("signal_id")
+            if signal_id and _LAST_SIGNAL_KEY.get(coin) != signal_id:
+                _LAST_SIGNAL_KEY[coin] = signal_id
+                _SIGNAL_HISTORY.insert(0, {"coin": coin, "direction": signal["status"], "score": signal.get("score", 0), "entry": signal.get("entry"), "sl": signal.get("sl"), "tp": signal.get("tp"), "created_at": time.time()})
+                del _SIGNAL_HISTORY[MAX_SIGNAL_HISTORY:]
 
 async def market_data_loop():
     while True:
@@ -586,8 +654,18 @@ def render_news_placeholder() -> str:
 
 
 def render_stats_placeholder() -> str:
-    return "📊 <b>Статистика</b>\n\nМодуль статистики будет подключён на этапе V1.2."
-
+    if not _SIGNAL_HISTORY:
+        return "📊 <b>Статистика</b>\n\nПодтверждённых сигналов пока нет."
+    total = len(_SIGNAL_HISTORY)
+    longs = sum(1 for x in _SIGNAL_HISTORY if x["direction"] == "LONG")
+    shorts = total - longs
+    avg_score = sum(x["score"] for x in _SIGNAL_HISTORY) / total
+    lines = ["📊 <b>Статистика сигналов</b>", "", f"Последние: <b>{total}</b> / 20", f"LONG: {longs} · SHORT: {shorts}", f"Средний балл: {avg_score:.1f}/8", "", "<b>Последние сигналы</b>"]
+    for item in _SIGNAL_HISTORY[:20]:
+        ts = time.strftime("%d.%m %H:%M", time.localtime(item["created_at"]))
+        lines.append(f"{ts} · {item['coin']} · {STATUS_EMOJI[item['direction']]} {item['direction']} · {item['score']}/8")
+    lines += ["", "Win Rate и P/L появятся после добавления автоматического контроля SL/TP."]
+    return "\n".join(lines)
 
 def main_menu_keyboard(states: dict) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
