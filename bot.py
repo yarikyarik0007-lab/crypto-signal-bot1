@@ -13,7 +13,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiohttp import web
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-
+STRATEGY_VERSION = "v1.0.0"
 COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "AVAX", "LINK", "SUI", "ZEC"]
 
 BINGX_BASE = "https://open-api.bingx.com"
