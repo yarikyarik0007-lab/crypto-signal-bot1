@@ -187,12 +187,12 @@ def compute_adx(candles: list[dict], period: int = 14) -> float | None:
         dx_series.append(100 * abs(p_di - m_di) / s if s else 0.0)
 
     if len(dx_series) < period:
-    return None
-# ADX — обычное усреднение Уайлдера над DX (0-100)
-adx = sum(dx_series[:period]) / period
-for dx in dx_series[period:]:
-    adx = (adx * (period - 1) + dx) / period
-return adx
+        return None
+    # ADX — обычное усреднение Уайлдера над DX (0-100)
+    adx = sum(dx_series[:period]) / period
+    for dx in dx_series[period:]:
+        adx = (adx * (period - 1) + dx) / period
+    return adx
 
 def classify_regime(candles: list[dict], idx: int) -> str:
     """TREND_UP / TREND_DOWN / RANGE / VOLATILE / UNKNOWN.
