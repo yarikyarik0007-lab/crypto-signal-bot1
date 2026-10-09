@@ -546,6 +546,17 @@ def summarize_by_regime(trades: list[dict]) -> dict:
     return {regime: summarize_trades(ts) for regime, ts in buckets.items()}
 
 
+def summarize_by_regime_and_dir(trades: list[dict]) -> dict:
+    """Группирует сделки по комбинации (режим, направление)."""
+    buckets: dict[str, list[dict]] = {}
+    for t in trades:
+        r = t.get("regime", "UNKNOWN")
+        d = t.get("dir", "UNKNOWN")
+        key = f"{r}|{d}"
+        buckets.setdefault(key, []).append(t)
+    return {key: summarize_trades(ts) for key, ts in buckets.items()}
+
+
 async def refresh_all_market_data():
     results = await asyncio.gather(*(fetch_coin_data(c) for c in COINS), return_exceptions=True)
     for coin, result in zip(COINS, results):
@@ -730,6 +741,22 @@ def render_backtest_all(per_coin: list[dict], overall: dict | None, all_trades: 
                     f"{reg}: {s['count']} сделок, WR {s['win_rate']}%, "
                     f"avg {s['avg_r']:+.2f}R, PF {s['profit_factor'] if s['profit_factor'] is not None else '∞'}"
                 )
+
+    if all_trades:
+        regime_dir_stats = summarize_by_regime_and_dir(all_trades)
+        if regime_dir_stats:
+            lines += ["", "🎯🎯 <b>По режимам + направлению</b>"]
+            regime_order = ["TREND_UP", "TREND_DOWN", "RANGE", "VOLATILE", "UNKNOWN"]
+            dir_order = ["LONG", "SHORT"]
+            for reg in regime_order:
+                for d in dir_order:
+                    s = regime_dir_stats.get(f"{reg}|{d}")
+                    if not s or s["count"] < 3:
+                        continue
+                    lines.append(
+                        f"{reg} + {d}: {s['count']} сделок, "
+                        f"WR {s['win_rate']}%, avg {s['avg_r']:+.2f}R"
+                    )
 
     if overall["count"] < 100:
         lines += ["", "⚠️ Суммарной выборки всё ещё немного — выводы предварительные."]
