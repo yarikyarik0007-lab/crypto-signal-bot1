@@ -29,6 +29,7 @@ DATA_NOTE = "📡 <i>Реальные данные BingX · вход и балл
 
 _MARKET_CACHE: dict[str, dict] = {}
 _SESSION: aiohttp.ClientSession | None = None
+_BACKTEST_ALL_RUNNING = False
 
 
 async def _get_json(url: str, params: dict) -> dict | None:
@@ -999,41 +1000,80 @@ async def cb_backtest(callback: CallbackQuery):
     )
 
 
+async def _perform_backtest_all(message: Message):
+    global _BACKTEST_ALL_RUNNING
+    try:
+        per_coin = []
+        all_trades = []
+        candles_by_coin = {}
+
+        # Историю скачиваем один раз и используем для обеих стратегий.
+        for index, coin in enumerate(COINS, start=1):
+            candles = await fetch_historical_klines(
+                BINGX_SYMBOL[coin], interval="4h", target=2000
+            )
+            candles_by_coin[coin] = candles
+            if len(candles) < 100:
+                per_coin.append({"coin": coin, "stats": None})
+            else:
+                trades = run_backtest(candles)
+                per_coin.append({"coin": coin, "stats": summarize_trades(trades)})
+                all_trades.extend(trades)
+
+            if index % 3 == 0 or index == len(COINS):
+                await message.edit_text(
+                    f"🧪 <b>Бэктест по всем монетам</b>\n"
+                    f"Загружено: {index}/{len(COINS)}. Считаю стратегии…"
+                )
+            await asyncio.sleep(0.2)
+
+        overall = summarize_trades(all_trades)
+
+        # Baseline использует уже загруженные свечи — без повторных запросов к BingX.
+        baseline_trades = []
+        for coin, candles in candles_by_coin.items():
+            if len(candles) >= 100:
+                baseline_trades.extend(run_backtest_baseline(candles))
+
+        baseline_stats = summarize_trades(baseline_trades)
+        await message.edit_text(
+            render_backtest_all(per_coin, overall, all_trades, baseline_stats),
+            reply_markup=back_keyboard()
+        )
+    except Exception:
+        logging.exception("Backtest-all failed")
+        try:
+            await message.edit_text(
+                "⚠️ <b>Не удалось завершить бэктест.</b>\n"
+                "Проверьте логи и попробуйте ещё раз позже.",
+                reply_markup=back_keyboard()
+            )
+        except Exception:
+            logging.exception("Could not show backtest error to user")
+    finally:
+        _BACKTEST_ALL_RUNNING = False
+
+
 @router.callback_query(F.data == "backtest_all")
 async def cb_backtest_all(callback: CallbackQuery):
-    await callback.answer("Скачиваю историю по всем монетам… это займёт около минуты")
-    per_coin = []
-    all_trades = []
-    for coin in COINS:
-        symbol = BINGX_SYMBOL[coin]
-        candles = await fetch_historical_klines(symbol, interval="4h", target=2000)
-        if len(candles) < 100:
-            per_coin.append({"coin": coin, "stats": None})
-            continue
-        trades = run_backtest(candles)
-        stats = summarize_trades(trades)
-        per_coin.append({"coin": coin, "stats": stats})
-        all_trades.extend(trades)
-        await asyncio.sleep(0.3)
+    global _BACKTEST_ALL_RUNNING
+    if _BACKTEST_ALL_RUNNING:
+        await callback.answer("Бэктест уже выполняется, дождись результата.")
+        return
 
-    overall = summarize_trades(all_trades)
+    _BACKTEST_ALL_RUNNING = True
+    await callback.answer("Запустил бэктест. Результат появится в этом сообщении.")
+    try:
+        await callback.message.edit_text(
+            "🧪 <b>Бэктест по всем монетам</b>\n"
+            "Подготовка данных BingX…",
+            reply_markup=back_keyboard()
+        )
+    except Exception:
+        _BACKTEST_ALL_RUNNING = False
+        raise
 
-    # Baseline: та же стратегия, но без логики пробоя — просто шорт в TREND_DOWN
-    baseline_trades = []
-    for coin in COINS:
-        symbol = BINGX_SYMBOL[coin]
-        candles = await fetch_historical_klines(symbol, interval="4h", target=2000)
-        if len(candles) < 100:
-            continue
-        bt = run_backtest_baseline(candles)
-        baseline_trades.extend(bt)
-        await asyncio.sleep(0.3)
-
-    baseline_stats = summarize_trades(baseline_trades)
-    await callback.message.edit_text(
-        render_backtest_all(per_coin, overall, all_trades, baseline_stats),
-        reply_markup=back_keyboard()
-    )
+    asyncio.create_task(_perform_backtest_all(callback.message))
 
 
 @router.callback_query(F.data.startswith("details:"))
