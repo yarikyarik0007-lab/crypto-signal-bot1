@@ -1079,6 +1079,13 @@ async def _perform_backtest_all(message: Message):
                 stats = summarize_trades(trades)
                 per_coin.append({"coin": coin, "stats": stats})
                 all_trades.extend(trades)
+                saved_count = await save_backtest_signals(
+                    trades, coin, STRATEGY_VERSION
+                )
+                logging.info(
+                    "Backtest progress: coin=%s trades=%s saved=%s",
+                    coin, len(trades), saved_count,
+                )
 
             if index % 3 == 0 or index == len(COINS):
                 await message.edit_text(
@@ -1218,6 +1225,18 @@ async def init_database() -> None:
                 CREATE INDEX IF NOT EXISTS idx_signals_status
                 ON signals (status)
             """)
+            await conn.execute("""
+                ALTER TABLE signals
+                ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'live'
+            """)
+            await conn.execute("""
+                ALTER TABLE signals
+                ADD COLUMN IF NOT EXISTS regime TEXT
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_signals_source
+                ON signals (source)
+            """)
             await conn.fetchval("SELECT 1")
         logging.info("PostgreSQL подключён; таблица signals готова.")
     except Exception:
@@ -1225,6 +1244,65 @@ async def init_database() -> None:
         if _DB_POOL is not None:
             await _DB_POOL.close()
             _DB_POOL = None
+
+
+async def save_backtest_signals(
+    trades: list[dict],
+    coin: str,
+    strategy_version: str,
+) -> int:
+    """Сохраняет сделки бэктеста в БД. Возвращает число сохранённых строк."""
+    if _DB_POOL is None or not trades:
+        return 0
+
+    rows = []
+    for trade in trades:
+        direction = trade.get("dir")
+        if direction not in ("LONG", "SHORT"):
+            continue
+        rows.append((
+            coin,
+            direction,
+            float(trade.get("r", 0.0)),
+            "CLOSED",
+            strategy_version,
+            trade.get("regime"),
+            "backtest",
+        ))
+
+    if not rows:
+        logging.warning("Backtest save skipped for %s: no valid trades", coin)
+        return 0
+
+    try:
+        async with _DB_POOL.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    DELETE FROM signals
+                    WHERE source = 'backtest'
+                      AND coin = $1
+                      AND strategy_version = $2
+                    """,
+                    coin, strategy_version,
+                )
+                await conn.executemany(
+                    """
+                    INSERT INTO signals
+                        (coin, direction, result_r, status,
+                         strategy_version, regime, source)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    """,
+                    rows,
+                )
+        logging.info(
+            "Backtest signals saved: coin=%s strategy=%s count=%s",
+            coin, strategy_version, len(rows),
+        )
+        return len(rows)
+    except Exception:
+        logging.exception("save_backtest_signals failed for %s", coin)
+        return 0
 
 
 async def main():
