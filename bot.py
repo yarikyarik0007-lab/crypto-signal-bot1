@@ -1016,8 +1016,10 @@ async def _perform_backtest_all(message: Message):
             if len(candles) < 100:
                 per_coin.append({"coin": coin, "stats": None})
             else:
-                trades = run_backtest(candles)
-                per_coin.append({"coin": coin, "stats": summarize_trades(trades)})
+                # CPU-heavy calculations must not block Telegram's asyncio event loop.
+                trades = await asyncio.to_thread(run_backtest, candles)
+                stats = summarize_trades(trades)
+                per_coin.append({"coin": coin, "stats": stats})
                 all_trades.extend(trades)
 
             if index % 3 == 0 or index == len(COINS):
@@ -1030,10 +1032,19 @@ async def _perform_backtest_all(message: Message):
         overall = summarize_trades(all_trades)
 
         # Baseline использует уже загруженные свечи — без повторных запросов к BingX.
+        # Показываем отдельный этап: baseline заметно тяжелее основной стратегии.
+        await message.edit_text(
+            "🧪 <b>Бэктест по всем монетам</b>\n"
+            "Основная стратегия рассчитана. Считаю baseline: 0/11…"
+        )
         baseline_trades = []
-        for coin, candles in candles_by_coin.items():
-            if len(candles) >= 100:
-                baseline_trades.extend(run_backtest_baseline(candles))
+        eligible = [(coin, candles) for coin, candles in candles_by_coin.items() if len(candles) >= 100]
+        for index, (coin, candles) in enumerate(eligible, start=1):
+            baseline_trades.extend(await asyncio.to_thread(run_backtest_baseline, candles))
+            await message.edit_text(
+                "🧪 <b>Бэктест по всем монетам</b>\n"
+                f"Основная стратегия готова. Baseline: {index}/{len(eligible)} ({coin})…"
+            )
 
         baseline_stats = summarize_trades(baseline_trades)
         await message.edit_text(
