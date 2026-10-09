@@ -506,6 +506,62 @@ def run_backtest(candles: list[dict], zone_lookback=BT_ZONE_LOOKBACK, rr_target=
     return trades
 
 
+def run_backtest_baseline(candles: list[dict], rr_target: float = 2.0,
+                          fee_r: float = BT_FEE_R) -> list[dict]:
+    """Baseline: входим SHORT на каждой свече в TREND_DOWN, без логики пробоя.
+    SL = 1% от цены, TP = rr_target * risk. Цель — сравнить с основной стратегией."""
+    n = len(candles)
+    trades = []
+    i = 50  # пропускаем первые 50 свечей для расчёта ADX
+
+    while i < n - 1:
+        # Определяем режим только для свечей, где он валиден
+        regime = classify_regime(candles, i)
+        if regime != "TREND_DOWN":
+            i += 1
+            continue
+
+        sig = candles[i]
+        entry = candles[i + 1]["o"]
+        risk = entry * 0.01  # 1% от цены
+        if risk <= 0:
+            i += 1
+            continue
+
+        sl = entry + risk
+        tp = entry - rr_target * risk  # SHORT
+
+        exit_r, exit_i = None, None
+        for k in range(i + 1, n):
+            c = candles[k]
+            hit_sl = c["h"] >= sl
+            hit_tp = c["l"] <= tp
+            if hit_sl:
+                exit_r, exit_i = -1.0, k
+                break
+            if hit_tp:
+                exit_r, exit_i = rr_target, k
+                break
+
+        if exit_r is None:
+            last = candles[-1]["c"]
+            exit_r = (entry - last) / risk
+            exit_i = n - 1
+
+        exit_r -= fee_r
+        trades.append({
+            "dir": "SHORT",
+            "entry_i": i + 1,
+            "exit_i": exit_i,
+            "r": round(exit_r, 2),
+            "regime": "TREND_DOWN",
+            "entry_time": candles[i + 1].get("t"),
+        })
+        i = exit_i + 1  # одна сделка за раз, как в основной стратегии
+
+    return trades
+
+
 def summarize_trades(trades: list[dict]) -> dict | None:
     if not trades:
         return None
@@ -569,6 +625,20 @@ def summarize_by_quarter(trades: list[dict]) -> dict:
         dt = datetime.datetime.utcfromtimestamp(ts / 1000)
         q = (dt.month - 1) // 3 + 1
         key = f"{dt.year}-Q{q}"
+        buckets.setdefault(key, []).append(t)
+    return {key: summarize_trades(ts) for key, ts in buckets.items()}
+
+
+def summarize_by_month(trades: list[dict]) -> dict:
+    """Группирует сделки по месяцам (YYYY-MM)."""
+    import datetime
+    buckets: dict[str, list[dict]] = {}
+    for t in trades:
+        ts = t.get("entry_time")
+        if ts is None:
+            continue
+        dt = datetime.datetime.utcfromtimestamp(ts / 1000)
+        key = f"{dt.year}-{dt.month:02d}"
         buckets.setdefault(key, []).append(t)
     return {key: summarize_trades(ts) for key, ts in buckets.items()}
 
@@ -710,7 +780,7 @@ def render_backtest(coin: str, candles_count: int, stats: dict | None) -> str:
     return "\n".join(lines)
 
 
-def render_backtest_all(per_coin: list[dict], overall: dict | None, all_trades: list[dict] | None = None) -> str:
+def render_backtest_all(per_coin: list[dict], overall: dict | None, all_trades: list[dict] | None = None, baseline_stats: dict | None = None) -> str:
     lines = ["🧪 <b>Бэктест по всем монетам</b>", DATA_NOTE, ""]
     lines.append(f"Версия стратегии: {STRATEGY_VERSION}")
     lines.append("Стратегия: пробой уровня + ретест, цель 2R")
@@ -789,6 +859,32 @@ def render_backtest_all(per_coin: list[dict], overall: dict | None, all_trades: 
                     f"{q}: {s['count']} сделок, WR {s['win_rate']}%, "
                     f"avg {s['avg_r']:+.2f}R, итого {s['total_r']:+.2f}R"
                 )
+
+    # Разбивка TREND_DOWN+SHORT по месяцам
+    if all_trades:
+        td_shorts = [t for t in all_trades
+                     if t.get("regime") == "TREND_DOWN" and t.get("dir") == "SHORT"]
+        m_stats = summarize_by_month(td_shorts)
+        if m_stats:
+            lines += ["", "📅 <b>TREND_DOWN+SHORT по месяцам</b>"]
+            for m in sorted(m_stats.keys()):
+                s = m_stats[m]
+                if not s:
+                    continue
+                lines.append(
+                    f"{m}: {s['count']} сделок, WR {s['win_rate']}%, "
+                    f"avg {s['avg_r']:+.2f}R"
+                )
+
+    # Baseline
+    if baseline_stats:
+        lines += ["", "⚖️ <b>Baseline (шорт в TREND_DOWN без логики пробоя)</b>"]
+        lines.append(
+            f"Сделок: {baseline_stats['count']}, WR {baseline_stats['win_rate']}%, "
+            f"avg {baseline_stats['avg_r']:+.2f}R, PF "
+            f"{baseline_stats['profit_factor'] if baseline_stats['profit_factor'] is not None else '∞'}, "
+            f"итого {baseline_stats['total_r']:+.2f}R"
+        )
 
     if overall["count"] < 100:
         lines += ["", "⚠️ Суммарной выборки всё ещё немного — выводы предварительные."]
@@ -921,8 +1017,22 @@ async def cb_backtest_all(callback: CallbackQuery):
         await asyncio.sleep(0.3)
 
     overall = summarize_trades(all_trades)
+
+    # Baseline: та же стратегия, но без логики пробоя — просто шорт в TREND_DOWN
+    baseline_trades = []
+    for coin in COINS:
+        symbol = BINGX_SYMBOL[coin]
+        candles = await fetch_historical_klines(symbol, interval="4h", target=2000)
+        if len(candles) < 100:
+            continue
+        bt = run_backtest_baseline(candles)
+        baseline_trades.extend(bt)
+        await asyncio.sleep(0.3)
+
+    baseline_stats = summarize_trades(baseline_trades)
     await callback.message.edit_text(
-        render_backtest_all(per_coin, overall, all_trades), reply_markup=back_keyboard()
+        render_backtest_all(per_coin, overall, all_trades, baseline_stats),
+        reply_markup=back_keyboard()
     )
 
 
