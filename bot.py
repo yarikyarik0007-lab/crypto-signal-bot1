@@ -557,6 +557,22 @@ def summarize_by_regime_and_dir(trades: list[dict]) -> dict:
     return {key: summarize_trades(ts) for key, ts in buckets.items()}
 
 
+def summarize_by_quarter(trades: list[dict]) -> dict:
+    """Группирует сделки по кварталам (YYYY-QN)."""
+    import datetime
+    buckets: dict[str, list[dict]] = {}
+    for t in trades:
+        ts = t.get("entry_time")
+        if ts is None:
+            continue
+        # BingX отдаёт timestamp в миллисекундах
+        dt = datetime.datetime.utcfromtimestamp(ts / 1000)
+        q = (dt.month - 1) // 3 + 1
+        key = f"{dt.year}-Q{q}"
+        buckets.setdefault(key, []).append(t)
+    return {key: summarize_trades(ts) for key, ts in buckets.items()}
+
+
 async def refresh_all_market_data():
     results = await asyncio.gather(*(fetch_coin_data(c) for c in COINS), return_exceptions=True)
     for coin, result in zip(COINS, results):
@@ -757,6 +773,22 @@ def render_backtest_all(per_coin: list[dict], overall: dict | None, all_trades: 
                         f"{reg} + {d}: {s['count']} сделок, "
                         f"WR {s['win_rate']}%, avg {s['avg_r']:+.2f}R"
                     )
+
+    if all_trades:
+        # Walk-forward: только TREND_DOWN + SHORT по кварталам
+        td_shorts = [t for t in all_trades
+                     if t.get("regime") == "TREND_DOWN" and t.get("dir") == "SHORT"]
+        q_stats = summarize_by_quarter(td_shorts)
+        if q_stats:
+            lines += ["", "📅 <b>TREND_DOWN+SHORT по кварталам</b>"]
+            for q in sorted(q_stats.keys()):
+                s = q_stats[q]
+                if not s:
+                    continue
+                lines.append(
+                    f"{q}: {s['count']} сделок, WR {s['win_rate']}%, "
+                    f"avg {s['avg_r']:+.2f}R, итого {s['total_r']:+.2f}R"
+                )
 
     if overall["count"] < 100:
         lines += ["", "⚠️ Суммарной выборки всё ещё немного — выводы предварительные."]
