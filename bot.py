@@ -4,6 +4,7 @@ import os
 import time
 
 import aiohttp
+import asyncpg
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -13,6 +14,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiohttp import web
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 STRATEGY_VERSION = "v0.5.1-experimental"
 
 COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "AVAX", "LINK", "SUI", "ZEC"]
@@ -29,6 +31,7 @@ DATA_NOTE = "📡 <i>Реальные данные BingX · вход и балл
 
 _MARKET_CACHE: dict[str, dict] = {}
 _SESSION: aiohttp.ClientSession | None = None
+_DB_POOL: asyncpg.Pool | None = None
 _BACKTEST_ALL_RUNNING = False
 
 
@@ -1173,6 +1176,57 @@ async def start_web_server():
     logging.info(f"Web server started on port {port}")
 
 
+async def init_database() -> None:
+    """Подключается к PostgreSQL и создаёт базовую таблицу сигналов."""
+    global _DB_POOL
+
+    if not DATABASE_URL:
+        logging.warning("DATABASE_URL не задан — PostgreSQL отключён.")
+        return
+
+    try:
+        _DB_POOL = await asyncpg.create_pool(
+            dsn=DATABASE_URL,
+            min_size=1,
+            max_size=5,
+            command_timeout=10,
+        )
+        async with _DB_POOL.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS signals (
+                    id BIGSERIAL PRIMARY KEY,
+                    coin TEXT NOT NULL,
+                    direction TEXT NOT NULL CHECK (direction IN ('LONG', 'SHORT')),
+                    entry_price DOUBLE PRECISION,
+                    stop_loss DOUBLE PRECISION,
+                    take_profit DOUBLE PRECISION,
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    result_r DOUBLE PRECISION,
+                    result_usd DOUBLE PRECISION,
+                    result_pct DOUBLE PRECISION,
+                    entry_reason TEXT,
+                    strategy_version TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    closed_at TIMESTAMPTZ
+                )
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_signals_created_at
+                ON signals (created_at DESC)
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_signals_status
+                ON signals (status)
+            """)
+            await conn.fetchval("SELECT 1")
+        logging.info("PostgreSQL подключён; таблица signals готова.")
+    except Exception:
+        logging.exception("Не удалось подключиться к PostgreSQL; бот продолжит работу без БД.")
+        if _DB_POOL is not None:
+            await _DB_POOL.close()
+            _DB_POOL = None
+
+
 async def main():
     global _SESSION
 
@@ -1184,6 +1238,7 @@ async def main():
 
     logging.basicConfig(level=logging.INFO)
 
+    await init_database()
     _SESSION = aiohttp.ClientSession()
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
