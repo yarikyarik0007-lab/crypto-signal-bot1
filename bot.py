@@ -325,7 +325,7 @@ async def fetch_historical_klines(symbol: str, interval: str = "4h", target: int
     """Постранично скачивает длинную историю свечей у BingX."""
     all_candles: list[dict] = []
     end_time = None
-    for _ in range(6):
+    for _ in range(10):
         if len(all_candles) >= target:
             break
         params = {"symbol": symbol, "interval": interval, "limit": 500}
@@ -785,7 +785,7 @@ def render_backtest_all(per_coin: list[dict], overall: dict | None, all_trades: 
     lines = ["🧪 <b>Бэктест по всем монетам</b>", DATA_NOTE, ""]
     lines.append(f"Версия стратегии: {STRATEGY_VERSION}")
     lines.append("Стратегия: пробой уровня + ретест, цель 2R")
-    lines.append("История: до 2000 свечей по 4ч на монету")
+    lines.append("История: до 4000 свечей по 4ч на монету (~666 дней)")
     lines.append("")
 
     if not overall:
@@ -986,7 +986,7 @@ async def cb_backtest(callback: CallbackQuery):
     coin = callback.data.split(":")[1]
     await callback.answer("Скачиваю историю и считаю бэктест… это займёт немного времени")
     symbol = BINGX_SYMBOL[coin]
-    candles = await fetch_historical_klines(symbol, interval="4h", target=2000)
+    candles = await fetch_historical_klines(symbol, interval="4h", target=4000)
     if len(candles) < 100:
         await callback.message.edit_text(
             f"🧪 <b>Бэктест · {coin}</b>\n{DATA_NOTE}\n\nНе удалось получить достаточно истории, попробуйте позже.",
@@ -1010,7 +1010,7 @@ async def _perform_backtest_all(message: Message):
         # Историю скачиваем один раз и используем для обеих стратегий.
         for index, coin in enumerate(COINS, start=1):
             candles = await fetch_historical_klines(
-                BINGX_SYMBOL[coin], interval="4h", target=2000
+                BINGX_SYMBOL[coin], interval="4h", target=4000
             )
             candles_by_coin[coin] = candles
             if len(candles) < 100:
