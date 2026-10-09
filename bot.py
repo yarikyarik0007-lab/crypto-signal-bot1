@@ -650,6 +650,22 @@ def summarize_by_month(trades: list[dict]) -> dict:
     return {key: summarize_trades(ts) for key, ts in buckets.items()}
 
 
+def split_trades_by_time(trades: list[dict], in_sample_ratio: float = 0.75) -> tuple[list[dict], list[dict]]:
+    """Делит сделки по временному диапазону: первые 75% истории и последние 25%."""
+    dated = [t for t in trades if t.get("entry_time") is not None]
+    if len(dated) < 4:
+        return dated, []
+    dated.sort(key=lambda t: t["entry_time"])
+    first_ts = dated[0]["entry_time"]
+    last_ts = dated[-1]["entry_time"]
+    cutoff_ts = first_ts + (last_ts - first_ts) * in_sample_ratio
+    is_trades = [t for t in dated if t["entry_time"] < cutoff_ts]
+    oos_trades = [t for t in dated if t["entry_time"] >= cutoff_ts]
+    if len(is_trades) < 2 or len(oos_trades) < 2:
+        return dated, []
+    return is_trades, oos_trades
+
+
 async def refresh_all_market_data():
     results = await asyncio.gather(*(fetch_coin_data(c) for c in COINS), return_exceptions=True)
     for coin, result in zip(COINS, results):
@@ -892,6 +908,39 @@ def render_backtest_all(per_coin: list[dict], overall: dict | None, all_trades: 
             f"{baseline_stats['profit_factor'] if baseline_stats['profit_factor'] is not None else '∞'}, "
             f"итого {baseline_stats['total_r']:+.2f}R"
         )
+
+    # Walk-forward: in-sample vs out-of-sample
+    if all_trades:
+        is_trades, oos_trades = split_trades_by_time(all_trades, 0.75)
+        if is_trades and oos_trades:
+            is_stats = summarize_trades(is_trades)
+            oos_stats = summarize_trades(oos_trades)
+            lines += ["", "🔬 <b>Walk-forward (in-sample 75% / out-of-sample 25%)</b>"]
+            if is_stats:
+                lines.append(
+                    f"IS: {is_stats['count']} сделок, WR {is_stats['win_rate']}%, "
+                    f"avg {is_stats['avg_r']:+.2f}R, PF "
+                    f"{is_stats['profit_factor'] if is_stats['profit_factor'] is not None else '∞'}, "
+                    f"итого {is_stats['total_r']:+.2f}R"
+                )
+            if oos_stats:
+                lines.append(
+                    f"OOS: {oos_stats['count']} сделок, WR {oos_stats['win_rate']}%, "
+                    f"avg {oos_stats['avg_r']:+.2f}R, PF "
+                    f"{oos_stats['profit_factor'] if oos_stats['profit_factor'] is not None else '∞'}, "
+                    f"итого {oos_stats['total_r']:+.2f}R"
+                )
+            if is_stats and oos_stats:
+                is_avg = is_stats["avg_r"]
+                oos_avg = oos_stats["avg_r"]
+                if is_avg > 0.15 and oos_avg > 0.15:
+                    lines.append("✅ Эдж подтверждён на OOS")
+                elif is_avg > 0.15 and oos_avg > 0:
+                    lines.append("⚠️ OOS слабее IS, но в плюсе — приемлемо")
+                elif is_avg > 0.15 and oos_avg <= 0:
+                    lines.append("❌ OOS в минусе — эдж может быть подогнан")
+                else:
+                    lines.append("⚠️ Эдж не подтверждён по порогу avg > +0.15R")
 
     if overall["count"] < 100:
         lines += ["", "⚠️ Суммарной выборки всё ещё немного — выводы предварительные."]
