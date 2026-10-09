@@ -435,6 +435,13 @@ def run_backtest(candles: list[dict], zone_lookback=BT_ZONE_LOOKBACK, rr_target=
             direction = triggered["dir"]
             level = triggered["level"]
 
+            # Фильтр: торгуем только SHORT в TREND_DOWN
+            regime = classify_regime(candles, i)
+            if regime != "TREND_DOWN" or direction != "SHORT":
+                pending = [p for p in pending if p is not triggered]
+                i += 1
+                continue
+
             if i + 1 >= n:
                 break
             entry = candles[i + 1]["o"]
@@ -472,7 +479,6 @@ def run_backtest(candles: list[dict], zone_lookback=BT_ZONE_LOOKBACK, rr_target=
                 exit_i = n - 1
 
             exit_r -= fee_r
-            regime = classify_regime(candles, i)
             trades.append({
                 "dir": direction,
                 "entry_i": i + 1,
