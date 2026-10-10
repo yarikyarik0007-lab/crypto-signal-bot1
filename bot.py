@@ -247,7 +247,8 @@ def describe_macd(macd: dict | None) -> str:
     if macd["hist"] > 0:
         return "Бычье пересечение"
     if macd["hist"] < 0:
-        return "Медвежье пересечение"    return "Нейтрально"
+        return "Медвежье пересечение"
+    return "Нейтрально"
 
 
 def describe_volume(volumes: list[float]) -> str:
