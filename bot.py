@@ -911,8 +911,10 @@ async def market_data_loop():
     """Обновляет кэш каждые 5 минут. Проверяет live-сигналы каждые 15 минут."""
     loop = asyncio.get_running_loop()
     next_live_check = 0.0
+    iteration = 0
 
     while True:
+        iteration += 1
         try:
             await refresh_all_market_data()
 
@@ -921,10 +923,28 @@ async def market_data_loop():
                 next_live_check = loop.time() + LIVE_SIGNALS_INTERVAL_SECONDS
                 await check_live_signals()
 
+            logging.info(
+                "Market loop heartbeat: iteration=%s, next_live_check_in=%ss",
+                iteration, int(next_live_check - loop.time())
+            )
+
         except Exception:
             logging.exception("Market data loop failed")
 
         await asyncio.sleep(300)
+
+
+async def market_data_supervisor():
+    """Перезапускает market_data_loop при неожиданном завершении."""
+    while True:
+        try:
+            await market_data_loop()
+        except asyncio.CancelledError:
+            logging.info("Market data supervisor cancelled")
+            raise
+        except Exception:
+            logging.exception("market_data_loop crashed, restarting in 10s")
+            await asyncio.sleep(10)
 
 
 def get_all_states() -> dict:
@@ -1878,7 +1898,7 @@ async def main():
     await asyncio.gather(
         dp.start_polling(bot),
         start_web_server(),
-        market_data_loop(),
+        market_data_supervisor(),
     )
 
 
