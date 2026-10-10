@@ -48,7 +48,10 @@ def is_candle_closed(candle_t_ms: int, interval_ms: int = 4 * 3600 * 1000) -> bo
     if not candle_t_ms:
         return False
     now_ms = int(time.time() * 1000)
-    return (now_ms - candle_t_ms) >= interval_ms
+    delta = now_ms - candle_t_ms
+    if delta < 0:
+        return False
+    return delta >= interval_ms
 
 
 async def _get_json(url: str, params: dict) -> dict | None:
@@ -683,6 +686,11 @@ async def check_live_signals() -> None:
                     coin
                 )
                 continue
+
+            logging.info(
+                "Live check: coin=%s last_candle_t=%s closed=%s",
+                coin, last_t, is_candle_closed(last_t)
+            )
 
             if not is_candle_closed(last_t):
                 closed_candles = candles[:-1]
