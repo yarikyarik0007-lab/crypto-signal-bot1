@@ -498,7 +498,8 @@ def run_backtest(candles: list[dict], zone_lookback=BT_ZONE_LOOKBACK, rr_target=
         resistance = find_pivot_level(candles, i, zone_lookback, "high")
         support = find_pivot_level(candles, i, zone_lookback, "low")
 
-        recent_vol = [c["v"] for c in candles[max(0, i - 10):i]]        avg_vol = sum(recent_vol) / len(recent_vol) if recent_vol else 0
+        recent_vol = [c["v"] for c in candles[max(0, i - 10):i]]
+        avg_vol = sum(recent_vol) / len(recent_vol) if recent_vol else 0
         vol_ok = avg_vol == 0 or sig["v"] >= avg_vol
 
         if resistance and sig["c"] > resistance * (1 + breakout_margin) and vol_ok:
