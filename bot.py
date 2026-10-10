@@ -34,6 +34,24 @@ _MARKET_CACHE: dict[str, dict] = {}
 _SESSION: aiohttp.ClientSession | None = None
 _DB_POOL: asyncpg.Pool | None = None
 _BACKTEST_ALL_RUNNING = False
+# C4.1: защита live-сигналов от повторного логирования.
+_LIVE_SIGNALS_SENT: set[str] = set()
+_LIVE_SIGNALS_ORDER: list[str] = []
+LIVE_SIGNALS_MAX_HISTORY = 1000
+LIVE_SIGNALS_INTERVAL_SECONDS = 15 * 60
+
+
+
+
+def is_candle_closed(candle_t_ms: int, interval_ms: int = 4 * 3600 * 1000) -> bool:
+    """True, если свеча с timestamp открытия t_ms уже закрыта."""
+    if not candle_t_ms:
+        return False
+    now_ms = int(time.time() * 1000)
+    delta = now_ms - candle_t_ms
+    if delta < 0:
+        return False
+    return delta >= interval_ms
 
 
 async def _get_json(url: str, params: dict) -> dict | None:
@@ -519,6 +537,213 @@ def run_backtest(candles: list[dict], zone_lookback=BT_ZONE_LOOKBACK, rr_target=
     return trades
 
 
+def evaluate_last_candle(candles: list[dict]) -> dict | None:
+    """C4.1: проверяет live-сигнал TREND_DOWN + SHORT на последней свече."""
+    if not candles or len(candles) < 100:
+        return None
+
+    n = len(candles)
+    last_idx = n - 1
+    candle_time = candles[last_idx].get("t")
+    if candle_time is None:
+        return None
+
+    pending: list[dict] = []
+    i = BT_ZONE_LOOKBACK + BT_PIVOT_WINDOW + 2
+
+    while i <= last_idx:
+        sig = candles[i]
+        pending = [
+            p for p in pending
+            if i - p["breakout_i"] <= BT_RETEST_WINDOW
+        ]
+
+        triggered = None
+        for p in pending:
+            if p["dir"] == "LONG":
+                retest_touch = sig["l"] <= p["level"] * (1 + BT_RETEST_TOLERANCE)
+                holds = sig["c"] > p["level"]
+                bullish = sig["c"] > sig["o"]
+                if retest_touch and holds and bullish:
+                    triggered = p
+                    break
+            else:
+                retest_touch = sig["h"] >= p["level"] * (1 - BT_RETEST_TOLERANCE)
+                holds = sig["c"] < p["level"]
+                bearish = sig["c"] < sig["o"]
+                if retest_touch and holds and bearish:
+                    triggered = p
+                    break
+
+        if triggered is not None:
+            pending = [p for p in pending if p is not triggered]
+            direction = triggered["dir"]
+            level = triggered["level"]
+            regime = classify_regime(candles, i)
+
+            if regime != "TREND_DOWN" or direction != "SHORT":
+                i += 1
+                continue
+
+            if i == last_idx:
+                entry = sig["c"]
+                sl = max(level * (1 + 0.005), sig["h"] * 1.002)
+                risk = sl - entry
+                if risk <= 0:
+                    return None
+                tp = entry - BT_RR_TARGET * risk
+                return {
+                    "direction": "SHORT",
+                    "level": level,
+                    "entry_price": entry,
+                    "sl_price": sl,
+                    "tp_price": tp,
+                    "rr": BT_RR_TARGET,
+                    "regime": regime,
+                    "candle_time": candle_time,
+                    "reason": "TREND_DOWN + пробой уровня + ретест + объём",
+                }
+
+            if i + 1 > last_idx:
+                return None
+
+            entry = candles[i + 1]["o"]
+            sl = max(level * (1 + 0.005), sig["h"] * 1.002)
+            risk = sl - entry
+            if risk <= 0:
+                i += 1
+                continue
+            tp = entry - BT_RR_TARGET * risk
+
+            pending = []
+            exit_i = None
+            for k in range(i + 1, last_idx + 1):
+                candle = candles[k]
+                if candle["h"] >= sl:
+                    exit_i = k
+                    break
+                if candle["l"] <= tp:
+                    exit_i = k
+                    break
+
+            if exit_i is None:
+                return None
+            if exit_i >= last_idx:
+                return None
+
+            i = exit_i + 1
+            continue
+
+        resistance = find_pivot_level(candles, i, BT_ZONE_LOOKBACK, "high")
+        support = find_pivot_level(candles, i, BT_ZONE_LOOKBACK, "low")
+
+        recent_vol = [c["v"] for c in candles[max(0, i - 10):i]]
+        avg_vol = sum(recent_vol) / len(recent_vol) if recent_vol else 0
+        vol_ok = avg_vol == 0 or sig["v"] >= avg_vol
+
+        if resistance and sig["c"] > resistance * (1 + BT_BREAKOUT_MARGIN) and vol_ok:
+            already_pending = any(
+                p["dir"] == "LONG" and p["level"] == resistance for p in pending
+            )
+            if not already_pending:
+                pending.append({
+                    "level": resistance, "dir": "LONG", "breakout_i": i
+                })
+
+        if support and sig["c"] < support * (1 - BT_BREAKOUT_MARGIN) and vol_ok:
+            already_pending = any(
+                p["dir"] == "SHORT" and p["level"] == support for p in pending
+            )
+            if not already_pending:
+                pending.append({
+                    "level": support, "dir": "SHORT", "breakout_i": i
+                })
+
+        i += 1
+
+    return None
+
+
+async def check_live_signals() -> None:
+    """C4.1: ищет live-сигналы по всем монетам; только логирование."""
+    found_count = 0
+    checked_count = 0
+
+    for coin in COINS:
+        checked_count += 1
+        try:
+            symbol = BINGX_SYMBOL[coin]
+            candles = await fetch_historical_klines(symbol, interval="4h", target=200)
+
+            if not candles:
+                logging.warning("Live signals: %s — no candles received", coin)
+                continue
+
+            last_t = candles[-1].get("t")
+            if not last_t:
+                logging.warning(
+                    "Live signals: %s — invalid candle timestamp",
+                    coin
+                )
+                continue
+
+            logging.info(
+                "Live check: coin=%s last_candle_t=%s closed=%s",
+                coin, last_t, is_candle_closed(last_t)
+            )
+
+            if not is_candle_closed(last_t):
+                closed_candles = candles[:-1]
+            else:
+                closed_candles = candles
+
+            if len(closed_candles) < 100:
+                logging.warning(
+                    "Live signals: %s — insufficient closed candles: %s",
+                    coin, len(closed_candles)
+                )
+                continue
+
+            sig = await asyncio.to_thread(evaluate_last_candle, closed_candles)
+            if sig is None:
+                continue
+
+            if sig.get("direction") != "SHORT" or sig.get("regime") != "TREND_DOWN":
+                continue
+
+            candle_time = sig.get("candle_time")
+            if candle_time is None:
+                continue
+
+            key = f"{coin}:{candle_time}"
+            if key in _LIVE_SIGNALS_SENT:
+                continue
+
+            _LIVE_SIGNALS_SENT.add(key)
+            _LIVE_SIGNALS_ORDER.append(key)
+
+            while len(_LIVE_SIGNALS_ORDER) > LIVE_SIGNALS_MAX_HISTORY:
+                oldest_key = _LIVE_SIGNALS_ORDER.pop(0)
+                _LIVE_SIGNALS_SENT.discard(oldest_key)
+
+            found_count += 1
+            logging.info(
+                "LIVE SIGNAL: coin=%s dir=%s entry=%.8f sl=%.8f tp=%.8f "
+                "regime=%s candle_time=%s rr=%.2f reason=%s",
+                coin, sig["direction"], sig["entry_price"], sig["sl_price"],
+                sig["tp_price"], sig["regime"], sig["candle_time"],
+                sig["rr"], sig["reason"]
+            )
+
+        except Exception:
+            logging.exception("Live signals check failed for coin=%s", coin)
+
+    logging.info(
+        "Live signals check: checked %s coins, found %s signals",
+        checked_count, found_count
+    )
+
+
 def run_backtest_baseline(candles: list[dict], rr_target: float = 2.0,
                           fee_r: float = BT_FEE_R) -> list[dict]:
     """Baseline: входим SHORT на каждой свече в TREND_DOWN, без логики пробоя.
@@ -683,8 +908,22 @@ async def refresh_all_market_data():
 
 
 async def market_data_loop():
+    """Обновляет кэш каждые 5 минут. Проверяет live-сигналы каждые 15 минут."""
+    loop = asyncio.get_running_loop()
+    next_live_check = 0.0
+
     while True:
-        await refresh_all_market_data()
+        try:
+            await refresh_all_market_data()
+
+            now = loop.time()
+            if now >= next_live_check:
+                next_live_check = loop.time() + LIVE_SIGNALS_INTERVAL_SECONDS
+                await check_live_signals()
+
+        except Exception:
+            logging.exception("Market data loop failed")
+
         await asyncio.sleep(300)
 
 
