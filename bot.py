@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import logging
 import os
 import time
@@ -490,6 +491,7 @@ def run_backtest(candles: list[dict], zone_lookback=BT_ZONE_LOOKBACK, rr_target=
                 "r": round(exit_r, 2),
                 "regime": regime,
                 "entry_time": candles[i + 1].get("t"),
+                "exit_time": candles[exit_i].get("t"),
             })
             pending = []
             i = exit_i + 1
@@ -567,6 +569,7 @@ def run_backtest_baseline(candles: list[dict], rr_target: float = 2.0,
             "r": round(exit_r, 2),
             "regime": "TREND_DOWN",
             "entry_time": candles[i + 1].get("t"),
+            "exit_time": candles[exit_i].get("t"),
         })
         i = exit_i + 1  # одна сделка за раз, как в основной стратегии
 
@@ -1538,8 +1541,18 @@ async def init_database() -> None:
             _DB_POOL = None
 
 
+def _ms_to_datetime(value: int | float | None) -> datetime.datetime | None:
+    """Конвертирует timestamp свечи в миллисекундах в UTC datetime."""
+    if value is None:
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(float(value) / 1000, tz=datetime.timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
 async def save_backtest_signals(
-    trades: list[dict],    coin: str,
+    trades: list[dict], coin: str,
     strategy_version: str,
 ) -> int:
     """Сохраняет сделки бэктеста в БД. Возвращает число сохранённых строк."""
@@ -1551,6 +1564,12 @@ async def save_backtest_signals(
         direction = trade.get("dir")
         if direction not in ("LONG", "SHORT"):
             continue
+        entry_dt = _ms_to_datetime(trade.get("entry_time"))
+        exit_dt = _ms_to_datetime(trade.get("exit_time"))
+        if entry_dt is None:
+            entry_dt = datetime.datetime.now(datetime.timezone.utc)
+        if exit_dt is None:
+            exit_dt = entry_dt
         rows.append((
             coin,
             direction,
@@ -1559,6 +1578,8 @@ async def save_backtest_signals(
             strategy_version,
             trade.get("regime"),
             "backtest",
+            entry_dt,
+            exit_dt,
         ))
 
     if not rows:
@@ -1581,8 +1602,8 @@ async def save_backtest_signals(
                     """
                     INSERT INTO signals
                         (coin, direction, result_r, status,
-                         strategy_version, regime, source)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                         strategy_version, regime, source, created_at, closed_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                     """,
                     rows,
                 )
