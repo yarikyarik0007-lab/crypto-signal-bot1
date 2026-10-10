@@ -241,6 +241,7 @@ def describe_ema(price: float, ema20: float | None, ema50: float | None) -> str:
     return "Цена между EMA20 и EMA50"
 
 
+# MACD description helper; keep each return on its own line.
 def describe_macd(macd: dict | None) -> str:
     if macd is None:
         return "Недостаточно данных"
