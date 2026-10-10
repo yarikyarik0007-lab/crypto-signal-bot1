@@ -955,8 +955,251 @@ def render_news_placeholder() -> str:
     return "📰 <b>Новости</b>\n\nМодуль новостного анализа будет подключён позже."
 
 
-def render_stats_placeholder() -> str:
-    return "📊 <b>Статистика</b>\n\nМодуль статистики будет подключён позже."
+async def get_stats(source: str) -> dict:
+    """Возвращает статистику завершённых сделок выбранного источника."""
+    if source not in ("backtest", "live"):
+        raise ValueError("source должен быть backtest или live")
+    if _DB_POOL is None:
+        raise RuntimeError("PostgreSQL не подключён")
+
+    async with _DB_POOL.acquire() as conn:
+        if source == "backtest":
+            summary = await conn.fetchrow("""
+                SELECT
+                    COUNT(*) AS total_signals,
+                    COUNT(*) FILTER (
+                        WHERE status = 'CLOSED' AND result_r IS NOT NULL
+                    ) AS closed_count,
+                    COUNT(*) FILTER (
+                        WHERE status = 'CLOSED' AND result_r > 0
+                    ) AS wins,
+                    COUNT(*) FILTER (
+                        WHERE status = 'CLOSED' AND result_r < 0
+                    ) AS losses,
+                    COUNT(*) FILTER (
+                        WHERE status = 'CLOSED' AND result_r = 0
+                    ) AS breakeven,
+                    COUNT(*) FILTER (
+                        WHERE status = 'CLOSED' AND direction = 'LONG'
+                    ) AS long_count,
+                    COUNT(*) FILTER (
+                        WHERE status = 'CLOSED' AND direction = 'SHORT'
+                    ) AS short_count,
+                    COALESCE(SUM(result_r) FILTER (
+                        WHERE status = 'CLOSED' AND result_r IS NOT NULL
+                    ), 0) AS total_r,
+                    COALESCE(SUM(result_r) FILTER (
+                        WHERE status = 'CLOSED' AND result_r > 0
+                    ), 0) AS gross_profit_r,
+                    COALESCE(SUM(result_r) FILTER (
+                        WHERE status = 'CLOSED' AND result_r < 0
+                    ), 0) AS gross_loss_r
+                FROM signals
+                WHERE source = 'backtest' AND strategy_version = $1
+            """, STRATEGY_VERSION)
+            by_coin = await conn.fetch("""
+                SELECT coin,
+                       COUNT(*) FILTER (
+                           WHERE status = 'CLOSED' AND result_r IS NOT NULL
+                       ) AS trades,
+                       COALESCE(SUM(result_r) FILTER (
+                           WHERE status = 'CLOSED' AND result_r IS NOT NULL
+                       ), 0) AS total_r
+                FROM signals
+                WHERE source = 'backtest' AND strategy_version = $1
+                GROUP BY coin
+                HAVING COUNT(*) FILTER (
+                    WHERE status = 'CLOSED' AND result_r IS NOT NULL
+                ) > 0
+                ORDER BY total_r DESC, coin
+            """, STRATEGY_VERSION)
+        else:
+            summary = await conn.fetchrow("""
+                SELECT
+                    COUNT(*) AS total_signals,
+                    COUNT(*) FILTER (
+                        WHERE status = 'CLOSED' AND result_r IS NOT NULL
+                    ) AS closed_count,
+                    COUNT(*) FILTER (
+                        WHERE status = 'CLOSED' AND result_r > 0
+                    ) AS wins,
+                    COUNT(*) FILTER (
+                        WHERE status = 'CLOSED' AND result_r < 0
+                    ) AS losses,
+                    COUNT(*) FILTER (
+                        WHERE status = 'CLOSED' AND result_r = 0
+                    ) AS breakeven,
+                    COUNT(*) FILTER (
+                        WHERE status = 'CLOSED' AND direction = 'LONG'
+                    ) AS long_count,
+                    COUNT(*) FILTER (
+                        WHERE status = 'CLOSED' AND direction = 'SHORT'
+                    ) AS short_count,
+                    COUNT(*) FILTER (WHERE status <> 'CLOSED') AS open_count,
+                    COALESCE(SUM(result_r) FILTER (
+                        WHERE status = 'CLOSED' AND result_r IS NOT NULL
+                    ), 0) AS total_r,
+                    COALESCE(SUM(result_r) FILTER (
+                        WHERE status = 'CLOSED' AND result_r > 0
+                    ), 0) AS gross_profit_r,
+                    COALESCE(SUM(result_r) FILTER (
+                        WHERE status = 'CLOSED' AND result_r < 0
+                    ), 0) AS gross_loss_r
+                FROM signals
+                WHERE source = 'live'
+            """)
+            by_coin = await conn.fetch("""
+                SELECT coin,
+                       COUNT(*) FILTER (
+                           WHERE status = 'CLOSED' AND result_r IS NOT NULL
+                       ) AS trades,
+                       COALESCE(SUM(result_r) FILTER (
+                           WHERE status = 'CLOSED' AND result_r IS NOT NULL
+                       ), 0) AS total_r
+                FROM signals
+                WHERE source = 'live'
+                GROUP BY coin
+                HAVING COUNT(*) FILTER (
+                    WHERE status = 'CLOSED' AND result_r IS NOT NULL
+                ) > 0
+                ORDER BY total_r DESC, coin
+            """)
+
+    data = dict(summary)
+    data["by_coin"] = [dict(row) for row in by_coin]
+    closed = int(data["closed_count"] or 0)
+    wins = int(data["wins"] or 0)
+    losses = int(data["losses"] or 0)
+    data["win_rate"] = (wins / (wins + losses) * 100) if wins + losses else None
+    data["avg_r"] = (float(data["total_r"] or 0) / closed) if closed else None
+    gross_profit = float(data["gross_profit_r"] or 0)
+    gross_loss = abs(float(data["gross_loss_r"] or 0))
+    data["profit_factor"] = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else None)
+    data["total_r"] = float(data["total_r"] or 0)
+    return data
+
+
+async def get_recent_signals(limit: int = 5, source: str = "backtest") -> list[dict]:
+    """Последние завершённые сделки; created_at — время записи в БД."""
+    if source not in ("backtest", "live"):
+        raise ValueError("source должен быть backtest или live")
+    if _DB_POOL is None:
+        raise RuntimeError("PostgreSQL не подключён")
+
+    async with _DB_POOL.acquire() as conn:
+        if source == "backtest":
+            rows = await conn.fetch("""
+                SELECT coin, direction, result_r, closed_at, created_at
+                FROM signals
+                WHERE source = 'backtest'
+                  AND strategy_version = $1
+                  AND status = 'CLOSED'
+                  AND result_r IS NOT NULL
+                ORDER BY COALESCE(closed_at, created_at) DESC, id DESC
+                LIMIT $2
+            """, STRATEGY_VERSION, max(1, min(int(limit), 20)))
+        else:
+            rows = await conn.fetch("""
+                SELECT coin, direction, result_r, closed_at, created_at
+                FROM signals
+                WHERE source = 'live'
+                  AND status = 'CLOSED'
+                  AND result_r IS NOT NULL
+                ORDER BY COALESCE(closed_at, created_at) DESC, id DESC
+                LIMIT $1
+            """, max(1, min(int(limit), 20)))
+    return [dict(row) for row in rows]
+
+
+def _format_r(value: float) -> str:
+    return f"{value:+.2f}R".replace("-", "−")
+
+
+def _render_stats_section(title: str, stats: dict, recent: list[dict], live: bool = False) -> list[str]:
+    lines = [title]
+    total_signals = int(stats.get("total_signals") or 0)
+    closed = int(stats.get("closed_count") or 0)
+    open_count = int(stats.get("open_count") or 0)
+    lines.append(f"Сделок закрыто: <b>{closed}</b>")
+    if live:
+        lines.append(f"Активных сигналов: <b>{open_count}</b>")
+    if closed == 0:
+        lines.append("Пока нет завершённых сделок.")
+        if live and total_signals == 0:
+            lines.append("Ждём первого live-сигнала.")
+        return lines
+
+    win_rate = stats.get("win_rate")
+    avg_r = stats.get("avg_r")
+    pf = stats.get("profit_factor")
+    lines.append(
+        f"Win Rate: <b>{win_rate:.1f}%</b>" if win_rate is not None
+        else "Win Rate: <b>н/д</b>"
+    )
+    lines.append(f"Средний результат: <b>{_format_r(avg_r)}</b>" if avg_r is not None else "Средний результат: <b>н/д</b>")
+    if pf is None:
+        pf_text = "н/д"
+    elif pf == float("inf"):
+        pf_text = "∞ (убытков нет)"
+    else:
+        pf_text = f"{pf:.2f}"
+    lines.append(f"Profit Factor: <b>{pf_text}</b>")
+    lines.append(f"Total R: <b>{_format_r(float(stats.get('total_r') or 0))}</b>")
+    lines.append(
+        f"LONG: {int(stats.get('long_count') or 0)} · "
+        f"SHORT: {int(stats.get('short_count') or 0)}"
+    )
+
+    by_coin = stats.get("by_coin") or []
+    if by_coin:
+        best = by_coin[0]
+        worst = min(by_coin, key=lambda row: float(row.get("total_r") or 0))
+        lines.append(f"🏆 Лучшая монета: <b>{best['coin']} ({_format_r(float(best['total_r']))})</b>")
+        lines.append(f"📉 Худшая монета: <b>{worst['coin']} ({_format_r(float(worst['total_r']))})</b>")
+
+    if recent:
+        lines.append("")
+        lines.append("<b>Последние сделки:</b>")
+        for trade in recent:
+            stamp = trade.get("closed_at") or trade.get("created_at")
+            date_text = stamp.strftime("%d.%m") if stamp else "дата н/д"
+            lines.append(
+                f"{trade['coin']} {trade['direction']}: "
+                f"<b>{_format_r(float(trade['result_r']))}</b> · {date_text}"
+            )
+    return lines
+
+
+async def render_stats() -> str:
+    """Формирует раздельную статистику бэктеста и live по данным PostgreSQL."""
+    if _DB_POOL is None:
+        return "📊 <b>Статистика</b>\n\n❌ PostgreSQL не подключён."
+
+    try:
+        backtest = await get_stats("backtest")
+        live = await get_stats("live")
+        recent_backtest = await get_recent_signals(limit=5, source="backtest")
+        recent_live = await get_recent_signals(limit=3, source="live")
+
+        lines = [
+            "📊 <b>Статистика стратегии</b>",
+            f"Версия бэктеста: <code>{STRATEGY_VERSION}</code>",
+            "",
+        ]
+        lines.extend(_render_stats_section("🧪 <b>Бэктест · тестирование</b>", backtest, recent_backtest))
+        lines.extend(["", "🔴 <b>Live · реальные сделки</b>"])
+        lines.extend(_render_stats_section("", live, recent_live, live=True))
+        lines.extend([
+            "",
+            "ℹ️ Бэктест и live считаются отдельно.",
+            "Время в списке — дата закрытия, если она записана; иначе дата создания записи в БД.",
+        ])
+        text = "\n".join(line for line in lines if line is not None)
+        # Telegram ограничивает длину сообщения 4096 символами.
+        return text[:4000]
+    except Exception:
+        logging.exception("render_stats failed")
+        return "📊 <b>Статистика</b>\n\n❌ Не удалось прочитать данные. Проверь логи Render."
 
 
 def main_menu_keyboard(states: dict) -> InlineKeyboardMarkup:
@@ -1216,8 +1459,9 @@ async def cb_news(callback: CallbackQuery):
 
 @router.callback_query(F.data == "stats")
 async def cb_stats(callback: CallbackQuery):
-    await callback.message.edit_text(render_stats_placeholder(), reply_markup=back_keyboard())
     await callback.answer()
+    text = await render_stats()
+    await callback.message.edit_text(text, reply_markup=back_keyboard())
 
 
 async def start_web_server():
