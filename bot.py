@@ -8,7 +8,7 @@ import asyncpg
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiohttp import web
@@ -247,8 +247,7 @@ def describe_macd(macd: dict | None) -> str:
     if macd["hist"] > 0:
         return "Бычье пересечение"
     if macd["hist"] < 0:
-        return "Медвежье пересечение"
-    return "Нейтрально"
+        return "Медвежье пересечение"    return "Нейтрально"
 
 
 def describe_volume(volumes: list[float]) -> str:
@@ -497,8 +496,7 @@ def run_backtest(candles: list[dict], zone_lookback=BT_ZONE_LOOKBACK, rr_target=
         resistance = find_pivot_level(candles, i, zone_lookback, "high")
         support = find_pivot_level(candles, i, zone_lookback, "low")
 
-        recent_vol = [c["v"] for c in candles[max(0, i - 10):i]]
-        avg_vol = sum(recent_vol) / len(recent_vol) if recent_vol else 0
+        recent_vol = [c["v"] for c in candles[max(0, i - 10):i]]        avg_vol = sum(recent_vol) / len(recent_vol) if recent_vol else 0
         vol_ok = avg_vol == 0 or sig["v"] >= avg_vol
 
         if resistance and sig["c"] > resistance * (1 + breakout_margin) and vol_ok:
@@ -747,8 +745,7 @@ def render_details(state: dict) -> str:
     atr_str = (
         f"${state['atr']:.2f} ({state['atr_pct']}% от цены)"
         if state.get("atr") and state.get("atr_pct") is not None
-        else "недостаточно данных"
-    )
+        else "недостаточно данных"    )
     return "\n".join([
         f"📋 <b>Детали · {coin}</b>",
         DATA_NOTE,
@@ -997,7 +994,6 @@ def back_keyboard(coin: str | None = None) -> InlineKeyboardMarkup:
     builder.row(InlineKeyboardButton(text="🏠 В меню", callback_data="back"))
     return builder.as_markup()
 
-
 router = Router()
 
 
@@ -1007,6 +1003,55 @@ async def cmd_start(message: Message):
         await refresh_all_market_data()
     states = get_all_states()
     await message.answer(render_main_menu(states), reply_markup=main_menu_keyboard(states))
+
+
+@router.message(Command("dbtest"))
+async def cmd_dbtest(message: Message):
+    """Показывает фактическое состояние записей в PostgreSQL."""
+    if _DB_POOL is None:
+        await message.answer("❌ PostgreSQL не подключён.")
+        return
+
+    try:
+        async with _DB_POOL.acquire() as conn:
+            summary = await conn.fetchrow("""
+                SELECT
+                    COUNT(*) AS total_count,
+                    COUNT(*) FILTER (WHERE source = 'backtest') AS backtest_count,
+                    COUNT(DISTINCT coin) FILTER (WHERE source = 'backtest') AS backtest_coins,
+                    COALESCE(SUM(result_r) FILTER (WHERE source = 'backtest'), 0) AS backtest_sum_r
+                FROM signals
+            """)
+            by_coin = await conn.fetch("""
+                SELECT coin, COUNT(*) AS trade_count,
+                       COALESCE(SUM(result_r), 0) AS sum_r
+                FROM signals
+                WHERE source = 'backtest'
+                GROUP BY coin
+                ORDER BY coin
+            """)
+
+        lines = [
+            "🗄 <b>Проверка PostgreSQL</b>",
+            f"Всего строк в signals: <b>{summary['total_count']}</b>",
+            f"Строк бэктеста: <b>{summary['backtest_count']}</b>",
+            f"Монет с записями: <b>{summary['backtest_coins']}</b>",
+            f"Сумма result_r: <b>{float(summary['backtest_sum_r']):+.2f}R</b>",
+        ]
+        if by_coin:
+            lines.append("")
+            lines.append("<b>По монетам:</b>")
+            for row in by_coin:
+                lines.append(
+                    f"{row['coin']}: {row['trade_count']} сделок, "
+                    f"{float(row['sum_r']):+.2f}R"
+                )
+        else:
+            lines.append("\n⚠️ Записей source='backtest' нет.")
+        await message.answer("\n".join(lines))
+    except Exception:
+        logging.exception("dbtest failed")
+        await message.answer("❌ Ошибка чтения PostgreSQL. Подробности — в логах Render.")
 
 
 @router.callback_query(F.data == "back")
@@ -1247,8 +1292,7 @@ async def init_database() -> None:
 
 
 async def save_backtest_signals(
-    trades: list[dict],
-    coin: str,
+    trades: list[dict],    coin: str,
     strategy_version: str,
 ) -> int:
     """Сохраняет сделки бэктеста в БД. Возвращает число сохранённых строк."""
@@ -1333,5 +1377,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
 
