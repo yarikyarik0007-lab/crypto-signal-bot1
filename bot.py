@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import logging
+import math
 import os
 import time
 
@@ -17,6 +18,7 @@ from aiohttp import web
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 SIGNAL_CHANNEL_ID = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
 STRATEGY_VERSION = "v0.5.1-experimental"
 
 COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "AVAX", "LINK", "SUI", "ZEC"]
@@ -665,6 +667,112 @@ def evaluate_last_candle(candles: list[dict]) -> dict | None:
     return None
 
 
+
+async def save_live_signal(sig: dict) -> int:
+    """Сохраняет live-сигнал. Возвращает ID или -1 при дубле/ошибке."""
+    if _DB_POOL is None:
+        logging.error("save_live_signal skipped: PostgreSQL is not connected")
+        return -1
+    try:
+        coin = str(sig.get("coin", "")).upper().strip()
+        direction = str(sig.get("direction", "")).upper().strip()
+        entry = float(sig.get("entry_price"))
+        sl = float(sig.get("sl_price", sig.get("stop_loss")))
+        tp = float(sig.get("tp_price", sig.get("take_profit")))
+        rr = float(sig.get("rr"))
+        regime = str(sig.get("regime", "UNKNOWN"))
+        reason = str(sig.get("reason", sig.get("entry_reason", "")))
+        if not coin or direction not in ("LONG", "SHORT"):
+            raise ValueError("missing coin or invalid direction")
+        if not all(math.isfinite(v) and v > 0 for v in (entry, sl, tp, rr)):
+            raise ValueError("entry/SL/TP/RR must be finite positive numbers")
+        if direction == "SHORT" and not (sl > entry > tp):
+            raise ValueError("SHORT requires SL > entry > TP")
+        if direction == "LONG" and not (tp > entry > sl):
+            raise ValueError("LONG requires TP > entry > SL")
+        async with _DB_POOL.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", coin)
+                existing = await conn.fetchval("""
+                    SELECT id FROM signals
+                    WHERE coin = $1 AND source = 'live' AND status = 'ACTIVE'
+                    LIMIT 1
+                """, coin)
+                if existing is not None:
+                    logging.info("Live signal skipped: active signal already exists for %s (id=%s)", coin, existing)
+                    return -1
+                cooling = await conn.fetchval("""
+                    SELECT id FROM signals
+                    WHERE coin = $1 AND source = 'live'
+                      AND (status IN ('WIN', 'LOSS')
+                           OR (status = 'CLOSED' AND result_r IS NOT NULL))
+                      AND closed_at >= NOW() - INTERVAL '4 hours'
+                    ORDER BY closed_at DESC LIMIT 1
+                """, coin)
+                if cooling is not None:
+                    logging.info("Live signal skipped: 4h cooldown for %s after id=%s", coin, cooling)
+                    return -1
+                row = await conn.fetchrow("""
+                    INSERT INTO signals
+                        (coin, direction, entry_price, stop_loss, take_profit,
+                         status, entry_reason, strategy_version, source, regime)
+                    VALUES ($1, $2, $3, $4, $5, 'ACTIVE', $6, $7, 'live', $8)
+                    ON CONFLICT DO NOTHING
+                    RETURNING id
+                """, coin, direction, entry, sl, tp, reason, STRATEGY_VERSION, regime)
+                if row is None:
+                    logging.info("Live signal insert ignored by database constraint for %s", coin)
+                    return -1
+                signal_id = int(row["id"])
+                logging.info("Live signal saved: id=%s coin=%s direction=%s", signal_id, coin, direction)
+                return signal_id
+    except Exception:
+        logging.exception("save_live_signal failed")
+        return -1
+
+
+async def notify_channel(sig: dict) -> bool:
+    """Публикует сигнал в канал; ошибки не прерывают live-цикл."""
+    if not SIGNAL_CHANNEL_ID:
+        logging.error("notify_channel skipped: SIGNAL_CHANNEL_ID is empty")
+        return False
+    try:
+        coin = str(sig.get("coin", "UNKNOWN")).upper()
+        direction = str(sig.get("direction", "")).upper()
+        entry = float(sig.get("entry_price"))
+        sl = float(sig.get("sl_price", sig.get("stop_loss")))
+        tp = float(sig.get("tp_price", sig.get("take_profit")))
+        rr = float(sig.get("rr"))
+        regime = str(sig.get("regime", "UNKNOWN"))
+        if direction not in ("LONG", "SHORT") or not all(
+            math.isfinite(v) and v > 0 for v in (entry, sl, tp, rr)
+        ):
+            raise ValueError("invalid signal values")
+        if direction == "SHORT" and not (sl > entry > tp):
+            raise ValueError("invalid SHORT entry/SL/TP relationship")
+        if direction == "LONG" and not (tp > entry > sl):
+            raise ValueError("invalid LONG entry/SL/TP relationship")
+        bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        try:
+            text = (
+                f"📣 <b>CRYPTO SIGNAL · {coin}</b>\n\n"
+                f"Направление: <b>{direction}</b>\n"
+                f"Entry: <code>{entry:.8g}</code>\n"
+                f"SL: <code>{sl:.8g}</code>\n"
+                f"TP: <code>{tp:.8g}</code>\n"
+                f"RR: <b>1:{rr:.2f}</b>\n"
+                f"Режим: <b>{regime}</b>"
+            )
+            await bot.send_message(chat_id=SIGNAL_CHANNEL_ID, text=text)
+        finally:
+            await bot.session.close()
+        logging.info("Live signal published: coin=%s direction=%s", coin, direction)
+        return True
+    except Exception:
+        logging.exception("notify_channel failed")
+        return False
+
+
 async def check_live_signals() -> None:
     """C4.1: ищет live-сигналы по всем монетам; только логирование."""
     found_count = 0
@@ -711,6 +819,7 @@ async def check_live_signals() -> None:
 
             if sig.get("direction") != "SHORT" or sig.get("regime") != "TREND_DOWN":
                 continue
+            sig["coin"] = coin
 
             candle_time = sig.get("candle_time")
             if candle_time is None:
@@ -728,6 +837,13 @@ async def check_live_signals() -> None:
                 _LIVE_SIGNALS_SENT.discard(oldest_key)
 
             found_count += 1
+            signal_id = await save_live_signal(sig)
+            if signal_id > 0:
+                sent = await notify_channel(sig)
+                logging.info("Live signal result: id=%s coin=%s channel_sent=%s", signal_id, coin, sent)
+            else:
+                logging.info("Live signal not saved/published: coin=%s candle_time=%s", coin, candle_time)
+
             logging.info(
                 "LIVE SIGNAL: coin=%s dir=%s entry=%.8f sl=%.8f tp=%.8f "
                 "regime=%s candle_time=%s rr=%.2f reason=%s",
@@ -1560,6 +1676,39 @@ async def cmd_test_channel(message: Message):
         )
 
 
+
+@router.message(Command("testsignal"))
+async def cmd_testsignal(message: Message):
+    """Создаёт тестовый live-сигнал BTC; доступен только ADMIN_USER_ID."""
+    if not message.from_user or not ADMIN_USER_ID or str(message.from_user.id) != ADMIN_USER_ID:
+        await message.answer("⛔ Команда доступна только администратору.")
+        return
+    try:
+        market = await fetch_coin_data("BTC")
+        price = market.get("price")
+        if price is None:
+            await message.answer("❌ Не удалось получить текущую цену BTC с BingX.")
+            return
+        entry = float(price)
+        if not math.isfinite(entry) or entry <= 0:
+            await message.answer("❌ Получена некорректная цена BTC.")
+            return
+        risk = entry * 0.005
+        sig = {
+            "coin": "BTC", "direction": "SHORT",
+            "entry_price": entry, "sl_price": entry + risk,
+            "tp_price": entry - risk * 2, "rr": 2.0,
+            "regime": "TEST", "reason": "TESTSIGNAL",
+            "entry_reason": "TESTSIGNAL",
+        }
+        signal_id = await save_live_signal(sig)
+        sent = await notify_channel(sig) if signal_id > 0 else False
+        await message.answer(f"Сохранено в БД: id={signal_id}. Отправлено в канал: {sent}")
+    except Exception:
+        logging.exception("/testsignal failed")
+        await message.answer("❌ Ошибка /testsignal. Подробности — в логах Render.")
+
+
 @router.message(Command("dbtest"))
 async def cmd_dbtest(message: Message):
     """Показывает фактическое состояние записей в PostgreSQL."""
@@ -1574,7 +1723,11 @@ async def cmd_dbtest(message: Message):
                     COUNT(*) AS total_count,
                     COUNT(*) FILTER (WHERE source = 'backtest') AS backtest_count,
                     COUNT(DISTINCT coin) FILTER (WHERE source = 'backtest') AS backtest_coins,
-                    COALESCE(SUM(result_r) FILTER (WHERE source = 'backtest'), 0) AS backtest_sum_r
+                    COALESCE(SUM(result_r) FILTER (WHERE source = 'backtest'), 0) AS backtest_sum_r,
+                    COUNT(*) FILTER (WHERE source = 'live' AND status = 'ACTIVE') AS live_active,
+                    COUNT(*) FILTER (WHERE source = 'live' AND status = 'WIN') AS live_wins,
+                    COUNT(*) FILTER (WHERE source = 'live' AND status = 'LOSS') AS live_losses,
+                    COUNT(DISTINCT coin) FILTER (WHERE source = 'live') AS live_coins
                 FROM signals
             """)
             by_coin = await conn.fetch("""
@@ -1585,6 +1738,15 @@ async def cmd_dbtest(message: Message):
                 GROUP BY coin
                 ORDER BY coin
             """)
+            live_by_coin = await conn.fetch("""
+                SELECT coin,
+                       COUNT(*) FILTER (WHERE status = 'ACTIVE') AS active_count,
+                       COUNT(*) FILTER (WHERE status = 'WIN') AS wins,
+                       COUNT(*) FILTER (WHERE status = 'LOSS') AS losses,
+                       COUNT(*) AS total_count
+                FROM signals WHERE source = 'live'
+                GROUP BY coin ORDER BY coin
+            """)
 
         lines = [
             "🗄 <b>Проверка PostgreSQL</b>",
@@ -1592,6 +1754,11 @@ async def cmd_dbtest(message: Message):
             f"Строк бэктеста: <b>{summary['backtest_count']}</b>",
             f"Монет с записями: <b>{summary['backtest_coins']}</b>",
             f"Сумма result_r: <b>{float(summary['backtest_sum_r']):+.2f}R</b>",
+            "",
+            "📡 <b>Live-сигналы</b>",
+            f"Активных: <b>{summary['live_active']}</b>",
+            f"WIN: <b>{summary['live_wins']}</b> · LOSS: <b>{summary['live_losses']}</b>",
+            f"Монет с live-записями: <b>{summary['live_coins']}</b>",
         ]
         if by_coin:
             lines.append("")
@@ -1603,6 +1770,17 @@ async def cmd_dbtest(message: Message):
                 )
         else:
             lines.append("\n⚠️ Записей source='backtest' нет.")
+        lines.append("")
+        lines.append("<b>Live по монетам:</b>")
+        if live_by_coin:
+            for row in live_by_coin:
+                lines.append(
+                    f"{row['coin']}: {row['active_count']} активных, "
+                    f"WIN {row['wins']}, LOSS {row['losses']} "
+                    f"(всего {row['total_count']})"
+                )
+        else:
+            lines.append("Live-записей пока нет.")
         await message.answer("\n".join(lines))
     except Exception:
         logging.exception("dbtest failed")
@@ -1837,6 +2015,11 @@ async def init_database() -> None:
             await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_signals_source
                 ON signals (source)
+            """)
+            await conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_signals_one_active_live_per_coin
+                ON signals (coin)
+                WHERE source = 'live' AND status = 'ACTIVE'
             """)
             await conn.fetchval("SELECT 1")
         logging.info("PostgreSQL подключён; таблица signals готова.")
