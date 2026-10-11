@@ -2020,11 +2020,36 @@ async def init_database() -> None:
                 CREATE INDEX IF NOT EXISTS idx_signals_source
                 ON signals (source)
             """)
-            await conn.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS uq_signals_one_active_live_per_coin
-                ON signals (coin)
-                WHERE source = 'live' AND status = 'ACTIVE'
-            """)
+            # Уникальный индекс — дополнительная защита от двух активных live-сигналов
+            # на одну монету. Ошибка здесь не должна отключать весь PostgreSQL.
+            try:
+                duplicates = await conn.fetch("""
+                    SELECT coin, COUNT(*) AS cnt
+                    FROM signals
+                    WHERE source = 'live' AND status = 'ACTIVE'
+                    GROUP BY coin
+                    HAVING COUNT(*) > 1
+                    ORDER BY coin
+                """)
+                if duplicates:
+                    duplicate_summary = [(row["coin"], row["cnt"]) for row in duplicates]
+                    logging.warning(
+                        "Duplicates found for active live signals: %s. "
+                        "Skipping unique index creation; resolve duplicates before retrying.",
+                        duplicate_summary,
+                    )
+                else:
+                    await conn.execute("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS uq_signals_one_active_live_per_coin
+                        ON signals (coin)
+                        WHERE source = 'live' AND status = 'ACTIVE'
+                    """)
+                    logging.info("Unique index for live signals ensured.")
+            except Exception:
+                logging.exception(
+                    "Failed to ensure unique index for active live signals. "
+                    "PostgreSQL remains available, but duplicate live signals may be possible."
+                )
             await conn.fetchval("SELECT 1")
         logging.info("PostgreSQL подключён; таблица signals готова.")
     except Exception:
