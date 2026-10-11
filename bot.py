@@ -669,8 +669,8 @@ def evaluate_last_candle(candles: list[dict]) -> dict | None:
 
 
 
-async def save_live_signal(sig: dict) -> int:
-    """Сохраняет live-сигнал. Возвращает ID или -1 при дубле/ошибке."""
+async def save_live_signal(sig: dict, source: str = "live") -> int:
+    """Сохраняет сигнал с указанным source. Возвращает ID или -1 при дубле/ошибке."""
     if _DB_POOL is None:
         logging.error("save_live_signal skipped: PostgreSQL is not connected")
         return -1
@@ -683,6 +683,9 @@ async def save_live_signal(sig: dict) -> int:
         rr = float(sig.get("rr"))
         regime = str(sig.get("regime", "UNKNOWN"))
         reason = str(sig.get("reason", sig.get("entry_reason", "")))
+        source = str(source).strip().lower()
+        if source not in ("live", "test"):
+            raise ValueError("source must be live or test")
         if not coin or direction not in ("LONG", "SHORT"):
             raise ValueError("missing coin or invalid direction")
         if not all(math.isfinite(v) and v > 0 for v in (entry, sl, tp, rr)):
@@ -717,10 +720,10 @@ async def save_live_signal(sig: dict) -> int:
                     INSERT INTO signals
                         (coin, direction, entry_price, stop_loss, take_profit,
                          status, entry_reason, strategy_version, source, regime)
-                    VALUES ($1, $2, $3, $4, $5, 'ACTIVE', $6, $7, 'live', $8)
+                    VALUES ($1, $2, $3, $4, $5, 'ACTIVE', $6, $7, $8, $9)
                     ON CONFLICT DO NOTHING
                     RETURNING id
-                """, coin, direction, entry, sl, tp, reason, STRATEGY_VERSION, regime)
+                """, coin, direction, entry, sl, tp, reason, STRATEGY_VERSION, source, regime)
                 if row is None:
                     logging.info("Live signal insert ignored by database constraint for %s", coin)
                     return -1
@@ -755,7 +758,11 @@ async def notify_channel(sig: dict) -> bool:
             raise ValueError("invalid LONG entry/SL/TP relationship")
         bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         try:
-            text = (
+            test_prefix = (
+                "🧪 <b>ТЕСТОВЫЙ СИГНАЛ (не торговать) 🧪</b>\n\n"
+                if sig.get("reason") == "TESTSIGNAL" else ""
+            )
+            text = test_prefix + (
                 f"📣 <b>CRYPTO SIGNAL · {coin}</b>\n\n"
                 f"Направление: <b>{direction}</b>\n"
                 f"Entry: <code>{entry:.8g}</code>\n"
@@ -1705,9 +1712,17 @@ async def cmd_testsignal(message: Message):
             "regime": "TEST", "reason": "TESTSIGNAL",
             "entry_reason": "TESTSIGNAL",
         }
-        signal_id = await save_live_signal(sig)
-        sent = await notify_channel(sig) if signal_id > 0 else False
-        await message.answer(f"Сохранено в БД: id={signal_id}. Отправлено в канал: {sent}")
+        signal_id = await save_live_signal(sig, source="test")
+        if signal_id > 0:
+            sent = await notify_channel(sig)
+            await message.answer(
+                f"✅ Тестовый сигнал сохранён: id={signal_id}. В канал: {sent}"
+            )
+        else:
+            await message.answer(
+                "⚠️ Тестовый сигнал не сохранён "
+                "(активный BTC уже есть или cooldown 4ч)."
+            )
     except Exception:
         logging.exception("/testsignal failed")
         await message.answer("❌ Ошибка /testsignal. Подробности — в логах Render.")
@@ -2040,7 +2055,7 @@ async def init_database() -> None:
                     )
                 else:
                     await conn.execute("""
-                        CREATE UNIQUE INDEX IF NOT EXISTS uq_signals_one_active_live_per_coin
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_active_live_signal
                         ON signals (coin)
                         WHERE source = 'live' AND status = 'ACTIVE'
                     """)
