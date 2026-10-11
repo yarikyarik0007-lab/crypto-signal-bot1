@@ -1729,8 +1729,26 @@ async def cmd_testsignal(message: Message):
 
 
 @router.message(Command("dbtest"))
+async def _send_long_message(message: Message, lines: list[str], limit: int = 3500):
+    """Отправляет длинный отчёт частями по строкам, сохраняя HTML-теги."""
+    chunks = []
+    current = ""
+    for line in lines:
+        if len(current) + len(line) + 1 > limit:
+            if current:
+                chunks.append(current)
+            current = line
+        else:
+            current = (current + "\\n" + line) if current else line
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        await message.answer(chunk)
+
+
 async def cmd_dbtest(message: Message):
-    """Показывает фактическое состояние записей в PostgreSQL."""
+    """Показывает состояние записей PostgreSQL по источникам."""
     if _DB_POOL is None:
         await message.answer("❌ PostgreSQL не подключён.")
         return
@@ -1740,57 +1758,147 @@ async def cmd_dbtest(message: Message):
             summary = await conn.fetchrow("""
                 SELECT
                     COUNT(*) AS total_count,
-                    COUNT(*) FILTER (WHERE source = 'backtest') AS backtest_count,
-                    COUNT(DISTINCT coin) FILTER (WHERE source = 'backtest') AS backtest_coins,
-                    COALESCE(SUM(result_r) FILTER (WHERE source = 'backtest'), 0) AS backtest_sum_r,
-                    COUNT(*) FILTER (WHERE source = 'live' AND status = 'ACTIVE') AS live_active,
-                    COUNT(*) FILTER (WHERE source = 'live' AND status = 'WIN') AS live_wins,
-                    COUNT(*) FILTER (WHERE source = 'live' AND status = 'LOSS') AS live_losses,
-                    COUNT(DISTINCT coin) FILTER (WHERE source = 'live') AS live_coins
+
+                    COUNT(*) FILTER (
+                        WHERE source = 'backtest'
+                    ) AS backtest_count,
+                    COUNT(DISTINCT coin) FILTER (
+                        WHERE source = 'backtest'
+                    ) AS backtest_coins,
+                    COALESCE(SUM(result_r) FILTER (
+                        WHERE source = 'backtest'
+                    ), 0) AS backtest_sum_r,
+
+                    COUNT(*) FILTER (
+                        WHERE source = 'live' AND status = 'ACTIVE'
+                    ) AS live_active,
+                    COUNT(*) FILTER (
+                        WHERE source = 'live' AND status = 'WIN'
+                    ) AS live_wins,
+                    COUNT(*) FILTER (
+                        WHERE source = 'live' AND status = 'LOSS'
+                    ) AS live_losses,
+                    COUNT(DISTINCT coin) FILTER (
+                        WHERE source = 'live'
+                    ) AS live_coins,
+
+                    COUNT(*) FILTER (
+                        WHERE source = 'test'
+                    ) AS test_count,
+                    COUNT(*) FILTER (
+                        WHERE source = 'test' AND status = 'ACTIVE'
+                    ) AS test_active,
+                    COUNT(*) FILTER (
+                        WHERE source = 'test' AND status = 'WIN'
+                    ) AS test_wins,
+                    COUNT(*) FILTER (
+                        WHERE source = 'test' AND status = 'LOSS'
+                    ) AS test_losses,
+                    COUNT(*) FILTER (
+                        WHERE source = 'test' AND status = 'CLOSED'
+                    ) AS test_closed,
+                    COUNT(DISTINCT coin) FILTER (
+                        WHERE source = 'test'
+                    ) AS test_coins,
+
+                    COUNT(*) FILTER (
+                        WHERE source IS NULL
+                           OR source NOT IN ('backtest', 'live', 'test')
+                    ) AS unknown_source
                 FROM signals
             """)
+
             by_coin = await conn.fetch("""
-                SELECT coin, COUNT(*) AS trade_count,
+                SELECT coin,
+                       COUNT(*) AS trade_count,
                        COALESCE(SUM(result_r), 0) AS sum_r
                 FROM signals
                 WHERE source = 'backtest'
                 GROUP BY coin
                 ORDER BY coin
             """)
+
             live_by_coin = await conn.fetch("""
                 SELECT coin,
-                       COUNT(*) FILTER (WHERE status = 'ACTIVE') AS active_count,
-                       COUNT(*) FILTER (WHERE status = 'WIN') AS wins,
-                       COUNT(*) FILTER (WHERE status = 'LOSS') AS losses,
+                       COUNT(*) FILTER (
+                           WHERE status = 'ACTIVE'
+                       ) AS active_count,
+                       COUNT(*) FILTER (
+                           WHERE status = 'WIN'
+                       ) AS wins,
+                       COUNT(*) FILTER (
+                           WHERE status = 'LOSS'
+                       ) AS losses,
                        COUNT(*) AS total_count
-                FROM signals WHERE source = 'live'
-                GROUP BY coin ORDER BY coin
+                FROM signals
+                WHERE source = 'live'
+                GROUP BY coin
+                ORDER BY coin
+            """)
+
+            test_by_coin = await conn.fetch("""
+                SELECT coin,
+                       COUNT(*) FILTER (
+                           WHERE status = 'ACTIVE'
+                       ) AS active_count,
+                       COUNT(*) FILTER (
+                           WHERE status = 'WIN'
+                       ) AS wins,
+                       COUNT(*) FILTER (
+                           WHERE status = 'LOSS'
+                       ) AS losses,
+                       COUNT(*) FILTER (
+                           WHERE status = 'CLOSED'
+                       ) AS closed_count,
+                       COUNT(*) AS total_count
+                FROM signals
+                WHERE source = 'test'
+                GROUP BY coin
+                ORDER BY coin
             """)
 
         lines = [
             "🗄 <b>Проверка PostgreSQL</b>",
-            f"Всего строк в signals: <b>{summary['total_count']}</b>",
-            f"Строк бэктеста: <b>{summary['backtest_count']}</b>",
-            f"Монет с записями: <b>{summary['backtest_coins']}</b>",
+            f"Всего строк: <b>{summary['total_count']}</b>",
+            "",
+            "📊 <b>Backtest</b>",
+            f"Записей: <b>{summary['backtest_count']}</b>",
+            f"Монет: <b>{summary['backtest_coins']}</b>",
             f"Сумма result_r: <b>{float(summary['backtest_sum_r']):+.2f}R</b>",
             "",
             "📡 <b>Live-сигналы</b>",
             f"Активных: <b>{summary['live_active']}</b>",
-            f"WIN: <b>{summary['live_wins']}</b> · LOSS: <b>{summary['live_losses']}</b>",
-            f"Монет с live-записями: <b>{summary['live_coins']}</b>",
+            f"WIN: <b>{summary['live_wins']}</b> · "
+            f"LOSS: <b>{summary['live_losses']}</b>",
+            f"Монет: <b>{summary['live_coins']}</b>",
+            "",
+            "🧪 <b>Test-сигналы</b>",
+            f"Всего: <b>{summary['test_count']}</b>",
+            f"Активных: <b>{summary['test_active']}</b>",
+            f"WIN: <b>{summary['test_wins']}</b> · "
+            f"LOSS: <b>{summary['test_losses']}</b>",
+            f"CLOSED: <b>{summary['test_closed']}</b>",
+            f"Монет: <b>{summary['test_coins']}</b>",
         ]
+
+        if summary["unknown_source"] > 0:
+            lines.extend([
+                "",
+                "⚠️ <b>Неизвестный source</b>",
+                f"Записей: <b>{summary['unknown_source']}</b>",
+            ])
+
+        lines.extend(["", "<b>Backtest по монетам:</b>"])
         if by_coin:
-            lines.append("")
-            lines.append("<b>По монетам:</b>")
             for row in by_coin:
                 lines.append(
                     f"{row['coin']}: {row['trade_count']} сделок, "
                     f"{float(row['sum_r']):+.2f}R"
                 )
         else:
-            lines.append("\n⚠️ Записей source='backtest' нет.")
-        lines.append("")
-        lines.append("<b>Live по монетам:</b>")
+            lines.append("Записей backtest пока нет.")
+
+        lines.extend(["", "<b>Live по монетам:</b>"])
         if live_by_coin:
             for row in live_by_coin:
                 lines.append(
@@ -1800,10 +1908,26 @@ async def cmd_dbtest(message: Message):
                 )
         else:
             lines.append("Live-записей пока нет.")
-        await message.answer("\n".join(lines))
+
+        lines.extend(["", "<b>Test по монетам:</b>"])
+        if test_by_coin:
+            for row in test_by_coin:
+                lines.append(
+                    f"{row['coin']}: {row['active_count']} активных, "
+                    f"WIN {row['wins']}, LOSS {row['losses']}, "
+                    f"CLOSED {row['closed_count']} "
+                    f"(всего {row['total_count']})"
+                )
+        else:
+            lines.append("Test-записей пока нет.")
+
+        await _send_long_message(message, lines)
+
     except Exception:
         logging.exception("dbtest failed")
-        await message.answer("❌ Ошибка чтения PostgreSQL. Подробности — в логах Render.")
+        await message.answer(
+            "❌ Ошибка чтения PostgreSQL. Подробности — в логах Render."
+        )
 
 
 @router.callback_query(F.data == "back")
