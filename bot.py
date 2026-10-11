@@ -1684,12 +1684,15 @@ async def cmd_testsignal(message: Message):
         await message.answer("⛔ Команда доступна только администратору.")
         return
     try:
-        market = await fetch_coin_data("BTC")
-        price = market.get("price")
-        if price is None:
+        price_payload = await _get_json(
+            f"{BINGX_BASE}/openApi/swap/v2/quote/price",
+            {"symbol": BINGX_SYMBOL["BTC"]},
+        )
+        try:
+            entry = float(price_payload["data"]["price"])
+        except (TypeError, KeyError, ValueError):
             await message.answer("❌ Не удалось получить текущую цену BTC с BingX.")
             return
-        entry = float(price)
         if not math.isfinite(entry) or entry <= 0:
             await message.answer("❌ Получена некорректная цена BTC.")
             return
