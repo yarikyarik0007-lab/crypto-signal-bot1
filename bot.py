@@ -16,6 +16,7 @@ from aiohttp import web
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+SIGNAL_CHANNEL_ID = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
 STRATEGY_VERSION = "v0.5.1-experimental"
 
 COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "AVAX", "LINK", "SUI", "ZEC"]
@@ -1511,6 +1512,52 @@ async def cmd_start(message: Message):
         await refresh_all_market_data()
     states = get_all_states()
     await message.answer(render_main_menu(states), reply_markup=main_menu_keyboard(states))
+
+
+@router.message(Command("test_channel"))
+async def cmd_test_channel(message: Message):
+    """Отправляет в канал одно техническое сообщение; доступно только администраторам канала."""
+    if message.chat.type != "private":
+        await message.answer("Открой личный чат с ботом и запусти /test_channel.")
+        return
+
+    if not message.from_user:
+        await message.answer("Не удалось определить пользователя Telegram.")
+        return
+
+    if not SIGNAL_CHANNEL_ID:
+        await message.answer(
+            "❌ Не задан SIGNAL_CHANNEL_ID в Render Environment. "
+            "Добавьте ID канала и повторите тест."
+        )
+        return
+
+    try:
+        admins = await message.bot.get_chat_administrators(chat_id=SIGNAL_CHANNEL_ID)
+        is_channel_admin = any(admin.user.id == message.from_user.id for admin in admins)
+        if not is_channel_admin:
+            await message.answer("⛔ Тест доступен только администратору целевого канала.")
+            return
+    except Exception:
+        logging.exception("Could not verify channel administrators for test")
+        await message.answer(
+            "❌ Не удалось проверить права канала. Убедитесь, что бот добавлен "
+            "в канал администратором с правом публикации."
+        )
+        return
+
+    try:
+        await message.bot.send_message(
+            chat_id=SIGNAL_CHANNEL_ID,
+            text="🧪 ТЕСТ: бот может писать в канал. Это техническая проверка, не торговый сигнал.",
+        )
+        await message.answer("✅ Тестовое сообщение отправлено в канал. Проверьте публикацию.")
+        logging.info("Test channel message sent by Telegram user %s", message.from_user.id)
+    except Exception:
+        logging.exception("Test channel message failed")
+        await message.answer(
+            "❌ Не получилось отправить сообщение. Проверьте ID канала и права бота."
+        )
 
 
 @router.message(Command("dbtest"))
