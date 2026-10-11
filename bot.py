@@ -699,20 +699,20 @@ async def save_live_signal(sig: dict, source: str = "live") -> int:
                 await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", coin)
                 existing = await conn.fetchval("""
                     SELECT id FROM signals
-                    WHERE coin = $1 AND source = 'live' AND status = 'ACTIVE'
+                    WHERE coin = $1 AND source = $2 AND status = 'ACTIVE'
                     LIMIT 1
-                """, coin)
+                """, coin, source)
                 if existing is not None:
                     logging.info("Live signal skipped: active signal already exists for %s (id=%s)", coin, existing)
                     return -1
                 cooling = await conn.fetchval("""
                     SELECT id FROM signals
-                    WHERE coin = $1 AND source = 'live'
+                    WHERE coin = $1 AND source = $2
                       AND (status IN ('WIN', 'LOSS')
                            OR (status = 'CLOSED' AND result_r IS NOT NULL))
                       AND closed_at >= NOW() - INTERVAL '4 hours'
                     ORDER BY closed_at DESC LIMIT 1
-                """, coin)
+                """, coin, source)
                 if cooling is not None:
                     logging.info("Live signal skipped: 4h cooldown for %s after id=%s", coin, cooling)
                     return -1
@@ -837,18 +837,27 @@ async def check_live_signals() -> None:
             if key in _LIVE_SIGNALS_SENT:
                 continue
 
-            _LIVE_SIGNALS_SENT.add(key)
-            _LIVE_SIGNALS_ORDER.append(key)
-
-            while len(_LIVE_SIGNALS_ORDER) > LIVE_SIGNALS_MAX_HISTORY:
-                oldest_key = _LIVE_SIGNALS_ORDER.pop(0)
-                _LIVE_SIGNALS_SENT.discard(oldest_key)
-
             found_count += 1
             signal_id = await save_live_signal(sig)
             if signal_id > 0:
+                # Mark the candle only after the database confirms the signal was saved.
+                # Channel delivery retries are intentionally deferred to a persistent outbox
+                # implementation; retrying here without delivery state can duplicate posts.
+                _LIVE_SIGNALS_SENT.add(key)
+                _LIVE_SIGNALS_ORDER.append(key)
+
+                while len(_LIVE_SIGNALS_ORDER) > LIVE_SIGNALS_MAX_HISTORY:
+                    oldest_key = _LIVE_SIGNALS_ORDER.pop(0)
+                    _LIVE_SIGNALS_SENT.discard(oldest_key)
+
                 sent = await notify_channel(sig)
-                logging.info("Live signal result: id=%s coin=%s channel_sent=%s", signal_id, coin, sent)
+                if sent:
+                    logging.info("Live signal result: id=%s coin=%s channel_sent=True", signal_id, coin)
+                else:
+                    logging.warning(
+                        "Live signal saved but channel notification failed: id=%s coin=%s candle_time=%s",
+                        signal_id, coin, candle_time
+                    )
             else:
                 logging.info("Live signal not saved/published: coin=%s candle_time=%s", coin, candle_time)
 
@@ -1728,7 +1737,6 @@ async def cmd_testsignal(message: Message):
         await message.answer("❌ Ошибка /testsignal. Подробности — в логах Render.")
 
 
-@router.message(Command("dbtest"))
 async def _send_long_message(message: Message, lines: list[str], limit: int = 3500):
     """Отправляет длинный отчёт частями по строкам, сохраняя HTML-теги."""
     chunks = []
@@ -1747,6 +1755,7 @@ async def _send_long_message(message: Message, lines: list[str], limit: int = 35
         await message.answer(chunk)
 
 
+@router.message(Command("dbtest"))
 async def cmd_dbtest(message: Message):
     """Показывает состояние записей PostgreSQL по источникам."""
     if _DB_POOL is None:
