@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import html
 import logging
 import os
 import time
@@ -17,6 +18,7 @@ from aiohttp import web
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 SIGNAL_CHANNEL_ID = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
 STRATEGY_VERSION = "v0.5.1-experimental"
 
 COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "AVAX", "LINK", "SUI", "ZEC"]
@@ -1921,6 +1923,51 @@ async def save_backtest_signals(
     except Exception:
         logging.exception("save_backtest_signals failed for %s", coin)
         return 0
+
+
+@router.message(Command("dbindexes"))
+async def cmd_dbindexes(message: Message):
+    """Read-only: показывает реальные индексы signals; доступ только администратору."""
+    if not message.from_user or not ADMIN_USER_ID or str(message.from_user.id) != ADMIN_USER_ID:
+        await message.answer("⛔ Команда доступна только администратору.")
+        return
+    if _DB_POOL is None:
+        await message.answer("⚠️ PostgreSQL не подключён. Проверь DATABASE_URL и логи Render.")
+        return
+
+    try:
+        async with _DB_POOL.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT schemaname, indexname, indexdef
+                FROM pg_indexes
+                WHERE tablename = 'signals'
+                  AND schemaname = current_schema()
+                ORDER BY indexname
+            """)
+            database = await conn.fetchval("SELECT current_database()")
+        lines = [
+            "🔎 <b>Индексы таблицы signals</b>",
+            f"База: <code>{html.escape(str(database))}</code>",
+            "",
+        ]
+        if not rows:
+            lines.append("Индексы не найдены в текущей схеме.")
+        else:
+            for row in rows:
+                lines.append(f"<b>{html.escape(str(row['indexname']))}</b>")
+                lines.append(f"<code>{html.escape(str(row['indexdef']))}</code>")
+                lines.append("")
+        output = "\n".join(lines)
+        # Telegram ограничивает длину сообщения; отправляем несколькими частями при необходимости.
+        while output:
+            chunk = output[:3500]
+            if len(output) > 3500 and "\n" in chunk:
+                chunk = chunk.rsplit("\n", 1)[0]
+            await message.answer(chunk)
+            output = output[len(chunk):].lstrip("\n")
+    except Exception:
+        logging.exception("/dbindexes failed")
+        await message.answer("❌ Не удалось прочитать индексы. Подробности — в логах Render.")
 
 
 async def main():
