@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import html
 import logging
+import math
 import os
 import time
 
@@ -667,6 +668,119 @@ def evaluate_last_candle(candles: list[dict]) -> dict | None:
     return None
 
 
+
+async def save_live_signal(sig: dict, source: str = "live") -> int:
+    """Сохраняет сигнал с указанным source. Возвращает ID или -1 при дубле/ошибке."""
+    if _DB_POOL is None:
+        logging.error("save_live_signal skipped: PostgreSQL is not connected")
+        return -1
+    try:
+        coin = str(sig.get("coin", "")).upper().strip()
+        direction = str(sig.get("direction", "")).upper().strip()
+        entry = float(sig.get("entry_price"))
+        sl = float(sig.get("sl_price", sig.get("stop_loss")))
+        tp = float(sig.get("tp_price", sig.get("take_profit")))
+        rr = float(sig.get("rr"))
+        regime = str(sig.get("regime", "UNKNOWN"))
+        reason = str(sig.get("reason", sig.get("entry_reason", "")))
+        source = str(source).strip().lower()
+        if source not in ("live", "test"):
+            raise ValueError("source must be live or test")
+        if not coin or direction not in ("LONG", "SHORT"):
+            raise ValueError("missing coin or invalid direction")
+        if not all(math.isfinite(v) and v > 0 for v in (entry, sl, tp, rr)):
+            raise ValueError("entry/SL/TP/RR must be finite positive numbers")
+        if direction == "SHORT" and not (sl > entry > tp):
+            raise ValueError("SHORT requires SL > entry > TP")
+        if direction == "LONG" and not (tp > entry > sl):
+            raise ValueError("LONG requires TP > entry > SL")
+        async with _DB_POOL.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", coin)
+                existing = await conn.fetchval("""
+                    SELECT id FROM signals
+                    WHERE coin = $1 AND source = $2 AND status = 'ACTIVE'
+                    LIMIT 1
+                """, coin, source)
+                if existing is not None:
+                    logging.info("Live signal skipped: active signal already exists for %s (id=%s)", coin, existing)
+                    return -1
+                cooling = await conn.fetchval("""
+                    SELECT id FROM signals
+                    WHERE coin = $1 AND source = $2
+                      AND (status IN ('WIN', 'LOSS')
+                           OR (status = 'CLOSED' AND result_r IS NOT NULL))
+                      AND closed_at >= NOW() - INTERVAL '4 hours'
+                    ORDER BY closed_at DESC LIMIT 1
+                """, coin, source)
+                if cooling is not None:
+                    logging.info("Live signal skipped: 4h cooldown for %s after id=%s", coin, cooling)
+                    return -1
+                row = await conn.fetchrow("""
+                    INSERT INTO signals
+                        (coin, direction, entry_price, stop_loss, take_profit,
+                         status, entry_reason, strategy_version, source, regime)
+                    VALUES ($1, $2, $3, $4, $5, 'ACTIVE', $6, $7, $8, $9)
+                    ON CONFLICT DO NOTHING
+                    RETURNING id
+                """, coin, direction, entry, sl, tp, reason, STRATEGY_VERSION, source, regime)
+                if row is None:
+                    logging.info("Live signal insert ignored by database constraint for %s", coin)
+                    return -1
+                signal_id = int(row["id"])
+                logging.info("Live signal saved: id=%s coin=%s direction=%s", signal_id, coin, direction)
+                return signal_id
+    except Exception:
+        logging.exception("save_live_signal failed")
+        return -1
+
+
+async def notify_channel(sig: dict) -> bool:
+    """Публикует сигнал в канал; ошибки не прерывают live-цикл."""
+    if not SIGNAL_CHANNEL_ID:
+        logging.error("notify_channel skipped: SIGNAL_CHANNEL_ID is empty")
+        return False
+    try:
+        coin = str(sig.get("coin", "UNKNOWN")).upper()
+        direction = str(sig.get("direction", "")).upper()
+        entry = float(sig.get("entry_price"))
+        sl = float(sig.get("sl_price", sig.get("stop_loss")))
+        tp = float(sig.get("tp_price", sig.get("take_profit")))
+        rr = float(sig.get("rr"))
+        regime = str(sig.get("regime", "UNKNOWN"))
+        if direction not in ("LONG", "SHORT") or not all(
+            math.isfinite(v) and v > 0 for v in (entry, sl, tp, rr)
+        ):
+            raise ValueError("invalid signal values")
+        if direction == "SHORT" and not (sl > entry > tp):
+            raise ValueError("invalid SHORT entry/SL/TP relationship")
+        if direction == "LONG" and not (tp > entry > sl):
+            raise ValueError("invalid LONG entry/SL/TP relationship")
+        bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        try:
+            test_prefix = (
+                "🧪 <b>ТЕСТОВЫЙ СИГНАЛ (не торговать) 🧪</b>\n\n"
+                if sig.get("reason") == "TESTSIGNAL" else ""
+            )
+            text = test_prefix + (
+                f"📣 <b>CRYPTO SIGNAL · {coin}</b>\n\n"
+                f"Направление: <b>{direction}</b>\n"
+                f"Entry: <code>{entry:.8g}</code>\n"
+                f"SL: <code>{sl:.8g}</code>\n"
+                f"TP: <code>{tp:.8g}</code>\n"
+                f"RR: <b>1:{rr:.2f}</b>\n"
+                f"Режим: <b>{regime}</b>"
+            )
+            await bot.send_message(chat_id=SIGNAL_CHANNEL_ID, text=text)
+        finally:
+            await bot.session.close()
+        logging.info("Live signal published: coin=%s direction=%s", coin, direction)
+        return True
+    except Exception:
+        logging.exception("notify_channel failed")
+        return False
+
+
 async def check_live_signals() -> None:
     """C4.1: ищет live-сигналы по всем монетам; только логирование."""
     found_count = 0
@@ -713,6 +827,7 @@ async def check_live_signals() -> None:
 
             if sig.get("direction") != "SHORT" or sig.get("regime") != "TREND_DOWN":
                 continue
+            sig["coin"] = coin
 
             candle_time = sig.get("candle_time")
             if candle_time is None:
@@ -722,14 +837,30 @@ async def check_live_signals() -> None:
             if key in _LIVE_SIGNALS_SENT:
                 continue
 
-            _LIVE_SIGNALS_SENT.add(key)
-            _LIVE_SIGNALS_ORDER.append(key)
-
-            while len(_LIVE_SIGNALS_ORDER) > LIVE_SIGNALS_MAX_HISTORY:
-                oldest_key = _LIVE_SIGNALS_ORDER.pop(0)
-                _LIVE_SIGNALS_SENT.discard(oldest_key)
-
             found_count += 1
+            signal_id = await save_live_signal(sig)
+            if signal_id > 0:
+                # Mark the candle only after the database confirms the signal was saved.
+                # Channel delivery retries are intentionally deferred to a persistent outbox
+                # implementation; retrying here without delivery state can duplicate posts.
+                _LIVE_SIGNALS_SENT.add(key)
+                _LIVE_SIGNALS_ORDER.append(key)
+
+                while len(_LIVE_SIGNALS_ORDER) > LIVE_SIGNALS_MAX_HISTORY:
+                    oldest_key = _LIVE_SIGNALS_ORDER.pop(0)
+                    _LIVE_SIGNALS_SENT.discard(oldest_key)
+
+                sent = await notify_channel(sig)
+                if sent:
+                    logging.info("Live signal result: id=%s coin=%s channel_sent=True", signal_id, coin)
+                else:
+                    logging.warning(
+                        "Live signal saved but channel notification failed: id=%s coin=%s candle_time=%s",
+                        signal_id, coin, candle_time
+                    )
+            else:
+                logging.info("Live signal not saved/published: coin=%s candle_time=%s", coin, candle_time)
+
             logging.info(
                 "LIVE SIGNAL: coin=%s dir=%s entry=%.8f sl=%.8f tp=%.8f "
                 "regime=%s candle_time=%s rr=%.2f reason=%s",
@@ -1562,9 +1693,71 @@ async def cmd_test_channel(message: Message):
         )
 
 
+
+@router.message(Command("testsignal"))
+async def cmd_testsignal(message: Message):
+    """Создаёт тестовый live-сигнал BTC; доступен только ADMIN_USER_ID."""
+    if not message.from_user or not ADMIN_USER_ID or str(message.from_user.id) != ADMIN_USER_ID:
+        await message.answer("⛔ Команда доступна только администратору.")
+        return
+    try:
+        price_payload = await _get_json(
+            f"{BINGX_BASE}/openApi/swap/v2/quote/price",
+            {"symbol": BINGX_SYMBOL["BTC"]},
+        )
+        try:
+            entry = float(price_payload["data"]["price"])
+        except (TypeError, KeyError, ValueError):
+            await message.answer("❌ Не удалось получить текущую цену BTC с BingX.")
+            return
+        if not math.isfinite(entry) or entry <= 0:
+            await message.answer("❌ Получена некорректная цена BTC.")
+            return
+        risk = entry * 0.005
+        sig = {
+            "coin": "BTC", "direction": "SHORT",
+            "entry_price": entry, "sl_price": entry + risk,
+            "tp_price": entry - risk * 2, "rr": 2.0,
+            "regime": "TEST", "reason": "TESTSIGNAL",
+            "entry_reason": "TESTSIGNAL",
+        }
+        signal_id = await save_live_signal(sig, source="test")
+        if signal_id > 0:
+            sent = await notify_channel(sig)
+            await message.answer(
+                f"✅ Тестовый сигнал сохранён: id={signal_id}. В канал: {sent}"
+            )
+        else:
+            await message.answer(
+                "⚠️ Тестовый сигнал не сохранён "
+                "(активный BTC уже есть или cooldown 4ч)."
+            )
+    except Exception:
+        logging.exception("/testsignal failed")
+        await message.answer("❌ Ошибка /testsignal. Подробности — в логах Render.")
+
+
+async def _send_long_message(message: Message, lines: list[str], limit: int = 3500):
+    """Отправляет длинный отчёт частями по строкам, сохраняя HTML-теги."""
+    chunks = []
+    current = ""
+    for line in lines:
+        if len(current) + len(line) + 1 > limit:
+            if current:
+                chunks.append(current)
+            current = line
+        else:
+            current = (current + "\n" + line) if current else line
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        await message.answer(chunk)
+
+
 @router.message(Command("dbtest"))
 async def cmd_dbtest(message: Message):
-    """Показывает фактическое состояние записей в PostgreSQL."""
+    """Показывает состояние записей PostgreSQL по источникам."""
     if _DB_POOL is None:
         await message.answer("❌ PostgreSQL не подключён.")
         return
@@ -1574,13 +1767,59 @@ async def cmd_dbtest(message: Message):
             summary = await conn.fetchrow("""
                 SELECT
                     COUNT(*) AS total_count,
-                    COUNT(*) FILTER (WHERE source = 'backtest') AS backtest_count,
-                    COUNT(DISTINCT coin) FILTER (WHERE source = 'backtest') AS backtest_coins,
-                    COALESCE(SUM(result_r) FILTER (WHERE source = 'backtest'), 0) AS backtest_sum_r
+
+                    COUNT(*) FILTER (
+                        WHERE source = 'backtest'
+                    ) AS backtest_count,
+                    COUNT(DISTINCT coin) FILTER (
+                        WHERE source = 'backtest'
+                    ) AS backtest_coins,
+                    COALESCE(SUM(result_r) FILTER (
+                        WHERE source = 'backtest'
+                    ), 0) AS backtest_sum_r,
+
+                    COUNT(*) FILTER (
+                        WHERE source = 'live' AND status = 'ACTIVE'
+                    ) AS live_active,
+                    COUNT(*) FILTER (
+                        WHERE source = 'live' AND status = 'WIN'
+                    ) AS live_wins,
+                    COUNT(*) FILTER (
+                        WHERE source = 'live' AND status = 'LOSS'
+                    ) AS live_losses,
+                    COUNT(DISTINCT coin) FILTER (
+                        WHERE source = 'live'
+                    ) AS live_coins,
+
+                    COUNT(*) FILTER (
+                        WHERE source = 'test'
+                    ) AS test_count,
+                    COUNT(*) FILTER (
+                        WHERE source = 'test' AND status = 'ACTIVE'
+                    ) AS test_active,
+                    COUNT(*) FILTER (
+                        WHERE source = 'test' AND status = 'WIN'
+                    ) AS test_wins,
+                    COUNT(*) FILTER (
+                        WHERE source = 'test' AND status = 'LOSS'
+                    ) AS test_losses,
+                    COUNT(*) FILTER (
+                        WHERE source = 'test' AND status = 'CLOSED'
+                    ) AS test_closed,
+                    COUNT(DISTINCT coin) FILTER (
+                        WHERE source = 'test'
+                    ) AS test_coins,
+
+                    COUNT(*) FILTER (
+                        WHERE source IS NULL
+                           OR source NOT IN ('backtest', 'live', 'test')
+                    ) AS unknown_source
                 FROM signals
             """)
+
             by_coin = await conn.fetch("""
-                SELECT coin, COUNT(*) AS trade_count,
+                SELECT coin,
+                       COUNT(*) AS trade_count,
                        COALESCE(SUM(result_r), 0) AS sum_r
                 FROM signals
                 WHERE source = 'backtest'
@@ -1588,27 +1827,116 @@ async def cmd_dbtest(message: Message):
                 ORDER BY coin
             """)
 
+            live_by_coin = await conn.fetch("""
+                SELECT coin,
+                       COUNT(*) FILTER (
+                           WHERE status = 'ACTIVE'
+                       ) AS active_count,
+                       COUNT(*) FILTER (
+                           WHERE status = 'WIN'
+                       ) AS wins,
+                       COUNT(*) FILTER (
+                           WHERE status = 'LOSS'
+                       ) AS losses,
+                       COUNT(*) AS total_count
+                FROM signals
+                WHERE source = 'live'
+                GROUP BY coin
+                ORDER BY coin
+            """)
+
+            test_by_coin = await conn.fetch("""
+                SELECT coin,
+                       COUNT(*) FILTER (
+                           WHERE status = 'ACTIVE'
+                       ) AS active_count,
+                       COUNT(*) FILTER (
+                           WHERE status = 'WIN'
+                       ) AS wins,
+                       COUNT(*) FILTER (
+                           WHERE status = 'LOSS'
+                       ) AS losses,
+                       COUNT(*) FILTER (
+                           WHERE status = 'CLOSED'
+                       ) AS closed_count,
+                       COUNT(*) AS total_count
+                FROM signals
+                WHERE source = 'test'
+                GROUP BY coin
+                ORDER BY coin
+            """)
+
         lines = [
             "🗄 <b>Проверка PostgreSQL</b>",
-            f"Всего строк в signals: <b>{summary['total_count']}</b>",
-            f"Строк бэктеста: <b>{summary['backtest_count']}</b>",
-            f"Монет с записями: <b>{summary['backtest_coins']}</b>",
+            f"Всего строк: <b>{summary['total_count']}</b>",
+            "",
+            "📊 <b>Backtest</b>",
+            f"Записей: <b>{summary['backtest_count']}</b>",
+            f"Монет: <b>{summary['backtest_coins']}</b>",
             f"Сумма result_r: <b>{float(summary['backtest_sum_r']):+.2f}R</b>",
+            "",
+            "📡 <b>Live-сигналы</b>",
+            f"Активных: <b>{summary['live_active']}</b>",
+            f"WIN: <b>{summary['live_wins']}</b> · "
+            f"LOSS: <b>{summary['live_losses']}</b>",
+            f"Монет: <b>{summary['live_coins']}</b>",
+            "",
+            "🧪 <b>Test-сигналы</b>",
+            f"Всего: <b>{summary['test_count']}</b>",
+            f"Активных: <b>{summary['test_active']}</b>",
+            f"WIN: <b>{summary['test_wins']}</b> · "
+            f"LOSS: <b>{summary['test_losses']}</b>",
+            f"CLOSED: <b>{summary['test_closed']}</b>",
+            f"Монет: <b>{summary['test_coins']}</b>",
         ]
+
+        if summary["unknown_source"] > 0:
+            lines.extend([
+                "",
+                "⚠️ <b>Неизвестный source</b>",
+                f"Записей: <b>{summary['unknown_source']}</b>",
+            ])
+
+        lines.extend(["", "<b>Backtest по монетам:</b>"])
         if by_coin:
-            lines.append("")
-            lines.append("<b>По монетам:</b>")
             for row in by_coin:
                 lines.append(
                     f"{row['coin']}: {row['trade_count']} сделок, "
                     f"{float(row['sum_r']):+.2f}R"
                 )
         else:
-            lines.append("\n⚠️ Записей source='backtest' нет.")
-        await message.answer("\n".join(lines))
+            lines.append("Записей backtest пока нет.")
+
+        lines.extend(["", "<b>Live по монетам:</b>"])
+        if live_by_coin:
+            for row in live_by_coin:
+                lines.append(
+                    f"{row['coin']}: {row['active_count']} активных, "
+                    f"WIN {row['wins']}, LOSS {row['losses']} "
+                    f"(всего {row['total_count']})"
+                )
+        else:
+            lines.append("Live-записей пока нет.")
+
+        lines.extend(["", "<b>Test по монетам:</b>"])
+        if test_by_coin:
+            for row in test_by_coin:
+                lines.append(
+                    f"{row['coin']}: {row['active_count']} активных, "
+                    f"WIN {row['wins']}, LOSS {row['losses']}, "
+                    f"CLOSED {row['closed_count']} "
+                    f"(всего {row['total_count']})"
+                )
+        else:
+            lines.append("Test-записей пока нет.")
+
+        await _send_long_message(message, lines)
+
     except Exception:
         logging.exception("dbtest failed")
-        await message.answer("❌ Ошибка чтения PostgreSQL. Подробности — в логах Render.")
+        await message.answer(
+            "❌ Ошибка чтения PostgreSQL. Подробности — в логах Render."
+        )
 
 
 @router.callback_query(F.data == "back")
@@ -1840,6 +2168,36 @@ async def init_database() -> None:
                 CREATE INDEX IF NOT EXISTS idx_signals_source
                 ON signals (source)
             """)
+            # Уникальный индекс — дополнительная защита от двух активных live-сигналов
+            # на одну монету. Ошибка здесь не должна отключать весь PostgreSQL.
+            try:
+                duplicates = await conn.fetch("""
+                    SELECT coin, COUNT(*) AS cnt
+                    FROM signals
+                    WHERE source = 'live' AND status = 'ACTIVE'
+                    GROUP BY coin
+                    HAVING COUNT(*) > 1
+                    ORDER BY coin
+                """)
+                if duplicates:
+                    duplicate_summary = [(row["coin"], row["cnt"]) for row in duplicates]
+                    logging.warning(
+                        "Duplicates found for active live signals: %s. "
+                        "Skipping unique index creation; resolve duplicates before retrying.",
+                        duplicate_summary,
+                    )
+                else:
+                    await conn.execute("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_active_live_signal
+                        ON signals (coin)
+                        WHERE source = 'live' AND status = 'ACTIVE'
+                    """)
+                    logging.info("Unique index for live signals ensured.")
+            except Exception:
+                logging.exception(
+                    "Failed to ensure unique index for active live signals. "
+                    "PostgreSQL remains available, but duplicate live signals may be possible."
+                )
             await conn.fetchval("SELECT 1")
         logging.info("PostgreSQL подключён; таблица signals готова.")
     except Exception:
@@ -1945,11 +2303,7 @@ async def cmd_dbindexes(message: Message):
                 ORDER BY indexname
             """)
             database = await conn.fetchval("SELECT current_database()")
-        lines = [
-            "🔎 <b>Индексы таблицы signals</b>",
-            f"База: <code>{html.escape(str(database))}</code>",
-            "",
-        ]
+        lines = [f"🔎 <b>Индексы таблицы signals</b>", f"База: <code>{html.escape(str(database))}</code>", ""]
         if not rows:
             lines.append("Индексы не найдены в текущей схеме.")
         else:
