@@ -1739,7 +1739,7 @@ async def _send_long_message(message: Message, lines: list[str], limit: int = 35
                 chunks.append(current)
             current = line
         else:
-            current = (current + "\\n" + line) if current else line
+            current = (current + "\n" + line) if current else line
     if current:
         chunks.append(current)
 
