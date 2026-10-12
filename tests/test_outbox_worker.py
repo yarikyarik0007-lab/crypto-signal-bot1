@@ -30,12 +30,13 @@ class FakeTransaction:
 
 
 class FakeConnection:
-    def __init__(self, task=None, fail_outbox_insert=False):
+    def __init__(self, task=None, fail_outbox_insert=False, fail_outbox_migration=False):
         self.task = task
         self.fetchrow_calls = []
         self.execute_calls = []
         self.rollback_observed = False
         self.fail_outbox_insert = fail_outbox_insert
+        self.fail_outbox_migration = fail_outbox_migration
         self.claimed = False
 
     def transaction(self):
@@ -52,11 +53,16 @@ class FakeConnection:
             return None
         raise AssertionError("Unexpected fetchrow query")
 
+    async def fetch(self, query, *args):
+        return []
+
     async def fetchval(self, query, *args):
         return None
 
     async def execute(self, query, *args):
         self.execute_calls.append((query, args))
+        if "CREATE TABLE IF NOT EXISTS outbox" in query and self.fail_outbox_migration:
+            raise RuntimeError("simulated outbox migration failure")
         if "INSERT INTO outbox" in query and self.fail_outbox_insert:
             raise RuntimeError("simulated outbox insert failure")
         return "UPDATE 1"
@@ -79,6 +85,9 @@ class FakePool:
 
     def acquire(self):
         return FakeAcquire(self.conn)
+
+    async def close(self):
+        return None
 
 
 def task(attempts=1, payload=None):
@@ -123,6 +132,17 @@ class OutboxWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("INSERT INTO signals" in q for q, _ in conn.fetchrow_calls))
         self.assertTrue(any("INSERT INTO outbox" in q for q, _ in conn.execute_calls))
         self.assertTrue(conn.rollback_observed)
+
+    async def test_init_database_keeps_outbox_unready_after_migration_failure(self):
+        conn = FakeConnection(fail_outbox_migration=True)
+        pool = FakePool(conn)
+        with patch.object(bot, "DATABASE_URL", "postgresql://test"), \\
+             patch.object(bot.asyncpg, "create_pool", AsyncMock(return_value=pool)), \\
+             patch.object(bot, "_DB_POOL", None), \\
+             patch.object(bot, "_OUTBOX_READY", True):
+            await bot.init_database()
+            self.assertFalse(bot._OUTBOX_READY)
+            self.assertIs(bot._DB_POOL, pool)
 
     async def test_live_signal_rejected_when_outbox_not_ready(self):
         conn = FakeConnection()
