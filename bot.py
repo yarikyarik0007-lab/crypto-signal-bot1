@@ -918,6 +918,19 @@ async def outbox_worker() -> None:
             logging.exception("Outbox worker failed to persist delivery result: id=%s", outbox_id)
 
 
+async def outbox_worker_supervisor() -> None:
+    """Перезапускает outbox_worker при неожиданном завершении."""
+    while True:
+        try:
+            await outbox_worker()
+        except asyncio.CancelledError:
+            logging.info("Outbox worker supervisor cancelled")
+            raise
+        except Exception:
+            logging.exception("outbox_worker crashed, restarting in 10s")
+            await asyncio.sleep(10)
+
+
 async def check_live_signals() -> None:
     """C4.1: ищет live-сигналы по всем монетам; только логирование."""
     found_count = 0
@@ -2513,7 +2526,7 @@ async def main():
         dp.start_polling(bot),
         start_web_server(),
         market_data_supervisor(),
-        outbox_worker(),
+        outbox_worker_supervisor(),
     )
 
 
