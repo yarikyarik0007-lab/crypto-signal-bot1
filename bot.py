@@ -38,6 +38,7 @@ DATA_NOTE = "📡 <i>Реальные данные BingX · вход и балл
 _MARKET_CACHE: dict[str, dict] = {}
 _SESSION: aiohttp.ClientSession | None = None
 _DB_POOL: asyncpg.Pool | None = None
+_OUTBOX_READY = False
 _BACKTEST_ALL_RUNNING = False
 # C4.1: защита live-сигналов от повторного логирования.
 _LIVE_SIGNALS_SENT: set[str] = set()
@@ -680,6 +681,12 @@ async def save_live_signal(sig: dict, source: str = "live") -> int:
     """Сохраняет сигнал с указанным source. Возвращает ID или -1 при дубле/ошибке."""
     if _DB_POOL is None:
         logging.error("save_live_signal skipped: PostgreSQL is not connected")
+        return -1
+    if source == "live" and not _OUTBOX_READY:
+        logging.error(
+            "save_live_signal skipped: Outbox schema is not ready; "
+            "refusing to create a live signal without a durable delivery task"
+        )
         return -1
     try:
         coin = str(sig.get("coin", "")).upper().strip()
@@ -2261,8 +2268,9 @@ async def start_web_server():
 
 
 async def init_database() -> None:
-    """Подключается к PostgreSQL и создаёт базовую таблицу сигналов."""
-    global _DB_POOL
+    """Подключается к PostgreSQL и создаёт таблицы signals и outbox."""
+    global _DB_POOL, _OUTBOX_READY
+    _OUTBOX_READY = False
 
     if not DATABASE_URL:
         logging.warning("DATABASE_URL не задан — PostgreSQL отключён.")
@@ -2344,8 +2352,9 @@ async def init_database() -> None:
                     "Failed to ensure unique index for active live signals. "
                     "PostgreSQL remains available, but duplicate live signals may be possible."
                 )
-            # C4.3 Этап 2: отдельная таблица для надёжной доставки уведомлений.
-            # Ошибка миграции outbox не должна отключать основной пул PostgreSQL.
+            # Outbox is required for live signals: a signal and its delivery task
+            # must be committed atomically. Keep the DB pool available for diagnostics,
+            # but explicitly disable live signal writes if migration/validation fails.
             try:
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS outbox (
@@ -2371,15 +2380,31 @@ async def init_database() -> None:
                     CREATE INDEX IF NOT EXISTS idx_outbox_signal_id
                     ON outbox (signal_id)
                 """)
-                logging.info("Outbox table ensured.")
+                # CREATE TABLE IF NOT EXISTS does not repair an incompatible old table.
+                await conn.fetchval("""
+                    SELECT id, signal_id, kind, payload, status, attempts,
+                           last_error, next_attempt_at, sent_at, created_at
+                    FROM outbox
+                    LIMIT 0
+                """)
+                _OUTBOX_READY = True
+                logging.info("Outbox table and required columns are ready.")
             except Exception:
+                _OUTBOX_READY = False
                 logging.exception(
-                    "Failed to ensure outbox table. Bot continues without it."
+                    "CRITICAL: Outbox is not ready. Live signal writes are disabled "
+                    "until the schema problem is fixed."
                 )
 
             await conn.fetchval("SELECT 1")
-        logging.info("PostgreSQL подключён; таблица signals готова.")
+        if _OUTBOX_READY:
+            logging.info("PostgreSQL подключён; таблицы signals и outbox готовы.")
+        else:
+            logging.error(
+                "PostgreSQL подключён, но Outbox не готов: сохранение live-сигналов отключено."
+            )
     except Exception:
+        _OUTBOX_READY = False
         logging.exception("Не удалось подключиться к PostgreSQL; бот продолжит работу без БД.")
         if _DB_POOL is not None:
             await _DB_POOL.close()
