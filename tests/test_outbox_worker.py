@@ -30,13 +30,15 @@ class FakeTransaction:
 
 
 class FakeConnection:
-    def __init__(self, task=None, fail_outbox_insert=False, fail_outbox_migration=False):
+    def __init__(self, task=None, fail_outbox_insert=False, fail_outbox_migration=False,
+                 fail_sent_update=False):
         self.task = task
         self.fetchrow_calls = []
         self.execute_calls = []
         self.rollback_observed = False
         self.fail_outbox_insert = fail_outbox_insert
         self.fail_outbox_migration = fail_outbox_migration
+        self.fail_sent_update = fail_sent_update
         self.claimed = False
 
     def transaction(self):
@@ -65,6 +67,8 @@ class FakeConnection:
             raise RuntimeError("simulated outbox migration failure")
         if "INSERT INTO outbox" in query and self.fail_outbox_insert:
             raise RuntimeError("simulated outbox insert failure")
+        if "SET status = 'SENT'" in query and self.fail_sent_update:
+            raise RuntimeError("simulated SENT persistence failure")
         return "UPDATE 1"
 
 
@@ -213,6 +217,29 @@ class OutboxWorkerTests(unittest.IsolatedAsyncioTestCase):
         notify.assert_awaited_once()
         sent = [(q, a) for q, a in recovered.execute_calls if "SET status = 'SENT'" in q]
         self.assertEqual(len(sent), 1)
+
+
+    async def test_telegram_acceptance_then_sent_write_failure_can_duplicate_after_restart(self):
+        # Simulate Telegram accepting the message, then the DB write for SENT failing.
+        # This does not call Telegram; notify_channel is a deterministic transport mock.
+        first_process_conn = FakeConnection(
+            task=task(attempts=1), fail_sent_update=True
+        )
+        first_notify = await self.run_worker_until_one_attempt(first_process_conn)
+        first_notify.assert_awaited_once()
+        self.assertTrue(any(
+            "SET status = 'SENT'" in q for q, _ in first_process_conn.execute_calls
+        ))
+
+        # The row remains recoverable as PENDING in the real design. A fresh worker
+        # can claim it after the lease expires and send it again: at-least-once semantics.
+        restarted_process_conn = FakeConnection(task=task(attempts=2))
+        second_notify = await self.run_worker_until_one_attempt(restarted_process_conn)
+        second_notify.assert_awaited_once()
+        self.assertEqual(first_notify.await_count + second_notify.await_count, 2)
+        self.assertTrue(any(
+            "SET status = 'SENT'" in q for q, _ in restarted_process_conn.execute_calls
+        ))
 
     async def test_test_signal_preserves_marker(self):
         payload = {
