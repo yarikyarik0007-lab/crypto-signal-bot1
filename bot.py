@@ -977,9 +977,7 @@ async def check_live_signals() -> None:
             found_count += 1
             signal_id = await save_live_signal(sig)
             if signal_id > 0:
-                # Mark the candle only after the database confirms the signal was saved.
-                # Channel delivery retries are intentionally deferred to a persistent outbox
-                # implementation; retrying here without delivery state can duplicate posts.
+                # Mark the candle only after the database confirms the signal and outbox row were saved.
                 _LIVE_SIGNALS_SENT.add(key)
                 _LIVE_SIGNALS_ORDER.append(key)
 
@@ -991,19 +989,18 @@ async def check_live_signals() -> None:
                     "LIVE SIGNAL SAVED (outbox queued): id=%s coin=%s candle_time=%s",
                     signal_id, coin, candle_time,
                 )
+                logging.info(
+                    "LIVE SIGNAL: coin=%s dir=%s entry=%.8f sl=%.8f tp=%.8f "
+                    "regime=%s candle_time=%s rr=%.2f reason=%s",
+                    coin, sig["direction"], sig["entry_price"], sig["sl_price"],
+                    sig["tp_price"], sig["regime"], sig["candle_time"],
+                    sig["rr"], sig["reason"]
+                )
             else:
                 logging.info(
                     "Live signal not saved (signal_id=%s; duplicate, cooldown, or DB error): coin=%s candle_time=%s",
                     signal_id, coin, candle_time,
                 )
-
-            logging.info(
-                "LIVE SIGNAL: coin=%s dir=%s entry=%.8f sl=%.8f tp=%.8f "
-                "regime=%s candle_time=%s rr=%.2f reason=%s",
-                coin, sig["direction"], sig["entry_price"], sig["sl_price"],
-                sig["tp_price"], sig["regime"], sig["candle_time"],
-                sig["rr"], sig["reason"]
-            )
 
         except Exception:
             logging.exception("Live signals check failed for coin=%s", coin)
