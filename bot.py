@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import html
+import json
 import logging
 import math
 import os
@@ -728,7 +729,24 @@ async def save_live_signal(sig: dict, source: str = "live") -> int:
                     logging.info("Live signal insert ignored by database constraint for %s", coin)
                     return -1
                 signal_id = int(row["id"])
-                logging.info("Live signal saved: id=%s coin=%s direction=%s", signal_id, coin, direction)
+                payload = {
+                    "coin": coin,
+                    "direction": direction,
+                    "entry_price": entry,
+                    "sl_price": sl,
+                    "tp_price": tp,
+                    "rr": rr,
+                    "regime": regime,
+                    "reason": reason,
+                }
+                await conn.execute("""
+                    INSERT INTO outbox (signal_id, kind, payload)
+                    VALUES ($1, 'telegram_channel', $2)
+                """, signal_id, json.dumps(payload))
+                logging.info(
+                    "Live signal and outbox task saved: id=%s coin=%s direction=%s",
+                    signal_id, coin, direction,
+                )
                 return signal_id
     except Exception:
         logging.exception("save_live_signal failed")
@@ -850,16 +868,15 @@ async def check_live_signals() -> None:
                     oldest_key = _LIVE_SIGNALS_ORDER.pop(0)
                     _LIVE_SIGNALS_SENT.discard(oldest_key)
 
-                sent = await notify_channel(sig)
-                if sent:
-                    logging.info("Live signal result: id=%s coin=%s channel_sent=True", signal_id, coin)
-                else:
-                    logging.warning(
-                        "Live signal saved but channel notification failed: id=%s coin=%s candle_time=%s",
-                        signal_id, coin, candle_time
-                    )
+                logging.info(
+                    "LIVE SIGNAL SAVED (outbox queued): id=%s coin=%s candle_time=%s",
+                    signal_id, coin, candle_time,
+                )
             else:
-                logging.info("Live signal not saved/published: coin=%s candle_time=%s", coin, candle_time)
+                logging.info(
+                    "Live signal not saved (duplicate in DB or cooldown): coin=%s candle_time=%s",
+                    coin, candle_time,
+                )
 
             logging.info(
                 "LIVE SIGNAL: coin=%s dir=%s entry=%.8f sl=%.8f tp=%.8f "
