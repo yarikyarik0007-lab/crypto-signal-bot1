@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install dependencies
-        run: pip install -r requirements.txt pytest
+        run: pip install -r requirements.txt pytest pytest-asyncio
       - name: Compile bot.py
         run: python -m py_compile bot.py
       - name: Run unit tests
