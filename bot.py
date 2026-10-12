@@ -827,8 +827,8 @@ async def outbox_worker() -> None:
                               AND kind = 'telegram_channel'
                               AND next_attempt_at <= NOW()
                             ORDER BY next_attempt_at, id
-                            FOR UPDATE SKIP LOCKED
                             LIMIT 1
+                            FOR UPDATE SKIP LOCKED
                         )
                         UPDATE outbox AS o
                         SET attempts = o.attempts + 1,
