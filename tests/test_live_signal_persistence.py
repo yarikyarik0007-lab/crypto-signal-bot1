@@ -77,7 +77,8 @@ VALID_SHORT = {
 class LiveSignalPersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_valid_short_is_saved_and_returns_id(self):
         conn = FakeConnection(inserted_id=42)
-        with patch.object(bot, "_DB_POOL", FakePool(conn)):
+        with patch.object(bot, "_DB_POOL", FakePool(conn)), \
+             patch.object(bot, "_OUTBOX_READY", True):
             result = await bot.save_live_signal(VALID_SHORT, source="live")
         self.assertEqual(result, 42)
         self.assertEqual(len(conn.fetchrow_calls), 1)
