@@ -116,7 +116,7 @@ class OutboxWorkerTests(unittest.IsolatedAsyncioTestCase):
             "sl_price": 101.0, "tp_price": 98.0, "rr": 2.0,
             "regime": "TREND_DOWN", "reason": "unit-test",
         }
-        with patch.object(bot, "_DB_POOL", FakePool(conn)), \\
+        with patch.object(bot, "_DB_POOL", FakePool(conn)), \
              patch.object(bot, "_OUTBOX_READY", True):
             result = await bot.save_live_signal(valid, source="live")
         self.assertEqual(result, -1)
@@ -131,7 +131,7 @@ class OutboxWorkerTests(unittest.IsolatedAsyncioTestCase):
             "sl_price": 101.0, "tp_price": 98.0, "rr": 2.0,
             "regime": "TREND_DOWN", "reason": "unit-test",
         }
-        with patch.object(bot, "_DB_POOL", FakePool(conn)), \\
+        with patch.object(bot, "_DB_POOL", FakePool(conn)), \
              patch.object(bot, "_OUTBOX_READY", False):
             result = await bot.save_live_signal(valid, source="live")
         self.assertEqual(result, -1)
