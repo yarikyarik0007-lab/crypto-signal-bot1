@@ -85,7 +85,8 @@ class LiveSignalValidationTests(unittest.TestCase):
 
     def test_valid_long_is_saved(self):
         conn = FakeConnection(inserted_id=456)
-        with patch.object(bot, "_DB_POOL", FakePool(conn)):
+        with patch.object(bot, "_DB_POOL", FakePool(conn)), \
+             patch.object(bot, "_OUTBOX_READY", True):
             result = asyncio.run(bot.save_live_signal(valid_signal("LONG"), source="live"))
         self.assertEqual(result, 456)
 
