@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import html
+import json
 import logging
 import math
 import os
@@ -37,12 +38,19 @@ DATA_NOTE = "📡 <i>Реальные данные BingX · вход и балл
 _MARKET_CACHE: dict[str, dict] = {}
 _SESSION: aiohttp.ClientSession | None = None
 _DB_POOL: asyncpg.Pool | None = None
+_OUTBOX_READY = False
 _BACKTEST_ALL_RUNNING = False
 # C4.1: защита live-сигналов от повторного логирования.
 _LIVE_SIGNALS_SENT: set[str] = set()
 _LIVE_SIGNALS_ORDER: list[str] = []
 LIVE_SIGNALS_MAX_HISTORY = 1000
 LIVE_SIGNALS_INTERVAL_SECONDS = 15 * 60
+
+# C4.3 Этап 4: параметры обработки transactional outbox.
+OUTBOX_POLL_INTERVAL_SECONDS = 30
+OUTBOX_CLAIM_LEASE_SECONDS = 300
+OUTBOX_MAX_ATTEMPTS = 8
+OUTBOX_MAX_BACKOFF_SECONDS = 1800
 
 
 
@@ -674,6 +682,12 @@ async def save_live_signal(sig: dict, source: str = "live") -> int:
     if _DB_POOL is None:
         logging.error("save_live_signal skipped: PostgreSQL is not connected")
         return -1
+    if source == "live" and not _OUTBOX_READY:
+        logging.error(
+            "save_live_signal skipped: Outbox schema is not ready; "
+            "refusing to create a live signal without a durable delivery task"
+        )
+        return -1
     try:
         coin = str(sig.get("coin", "")).upper().strip()
         direction = str(sig.get("direction", "")).upper().strip()
@@ -728,7 +742,24 @@ async def save_live_signal(sig: dict, source: str = "live") -> int:
                     logging.info("Live signal insert ignored by database constraint for %s", coin)
                     return -1
                 signal_id = int(row["id"])
-                logging.info("Live signal saved: id=%s coin=%s direction=%s", signal_id, coin, direction)
+                payload = {
+                    "coin": coin,
+                    "direction": direction,
+                    "entry_price": entry,
+                    "sl_price": sl,
+                    "tp_price": tp,
+                    "rr": rr,
+                    "regime": regime,
+                    "reason": reason,
+                }
+                await conn.execute("""
+                    INSERT INTO outbox (signal_id, kind, payload)
+                    VALUES ($1, 'telegram_channel', $2)
+                """, signal_id, json.dumps(payload))
+                logging.info(
+                    "Live signal and outbox task saved: id=%s coin=%s direction=%s",
+                    signal_id, coin, direction,
+                )
                 return signal_id
     except Exception:
         logging.exception("save_live_signal failed")
@@ -779,6 +810,132 @@ async def notify_channel(sig: dict) -> bool:
     except Exception:
         logging.exception("notify_channel failed")
         return False
+
+
+async def outbox_worker() -> None:
+    """Доставляет PENDING-задачи Outbox с ограниченными повторами и backoff."""
+    while True:
+        if _DB_POOL is None:
+            await asyncio.sleep(OUTBOX_POLL_INTERVAL_SECONDS)
+            continue
+
+        task = None
+        try:
+            # Короткая транзакция атомарно забирает одну задачу.
+            # Lease не даёт другому worker забрать её, пока выполняется отправка.
+            async with _DB_POOL.acquire() as conn:
+                async with conn.transaction():
+                    task = await conn.fetchrow(
+                        """
+                        WITH candidate AS (
+                            SELECT id
+                            FROM outbox
+                            WHERE status = 'PENDING'
+                              AND kind = 'telegram_channel'
+                              AND next_attempt_at <= NOW()
+                            ORDER BY next_attempt_at, id
+                            LIMIT 1
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        UPDATE outbox AS o
+                        SET attempts = o.attempts + 1,
+                            next_attempt_at = NOW() + ($1::int * INTERVAL '1 second')
+                        FROM candidate
+                        WHERE o.id = candidate.id
+                        RETURNING o.id, o.signal_id, o.payload, o.attempts
+                        """,
+                        OUTBOX_CLAIM_LEASE_SECONDS,
+                    )
+        except Exception:
+            logging.exception("Outbox worker failed to claim a task")
+            await asyncio.sleep(OUTBOX_POLL_INTERVAL_SECONDS)
+            continue
+
+        if task is None:
+            await asyncio.sleep(OUTBOX_POLL_INTERVAL_SECONDS)
+            continue
+
+        outbox_id = int(task["id"])
+        attempts = int(task["attempts"])
+        error_text = None
+        sent = False
+
+        try:
+            payload = task["payload"]
+            # asyncpg обычно возвращает JSONB как str без пользовательского codec.
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            if not isinstance(payload, dict):
+                raise ValueError("Outbox payload must be a JSON object")
+            sent = await notify_channel(payload)
+            if not sent:
+                raise RuntimeError("notify_channel returned False")
+        except Exception as exc:
+            error_text = str(exc)[:2000]
+            logging.warning(
+                "Outbox delivery failed: id=%s signal_id=%s attempt=%s error=%s",
+                outbox_id, task["signal_id"], attempts, error_text,
+            )
+
+        try:
+            async with _DB_POOL.acquire() as conn:
+                if sent:
+                    await conn.execute(
+                        """
+                        UPDATE outbox
+                        SET status = 'SENT',
+                            sent_at = NOW(),
+                            last_error = NULL
+                        WHERE id = $1 AND status = 'PENDING'
+                        """,
+                        outbox_id,
+                    )
+                    logging.info(
+                        "Outbox delivery succeeded: id=%s signal_id=%s attempts=%s",
+                        outbox_id, task["signal_id"], attempts,
+                    )
+                else:
+                    if attempts >= OUTBOX_MAX_ATTEMPTS:
+                        status = "FAILED"
+                        delay_seconds = 0
+                    else:
+                        status = "PENDING"
+                        delay_seconds = min(
+                            30 * (2 ** max(0, attempts - 1)),
+                            OUTBOX_MAX_BACKOFF_SECONDS,
+                        )
+                    await conn.execute(
+                        """
+                        UPDATE outbox
+                        SET status = $2,
+                            last_error = $3,
+                            next_attempt_at = NOW() + ($4::int * INTERVAL '1 second')
+                        WHERE id = $1 AND status = 'PENDING'
+                        """,
+                        outbox_id, status, error_text or "Unknown delivery error",
+                        delay_seconds,
+                    )
+                    logging.info(
+                        "Outbox task rescheduled: id=%s status=%s attempts=%s delay_seconds=%s",
+                        outbox_id, status, attempts, delay_seconds,
+                    )
+        except Exception:
+            # Если Telegram принял сообщение, а запись SENT не сохранилась,
+            # задача может быть отправлена повторно после lease. Это at-least-once delivery.
+            logging.exception("Outbox worker failed to persist delivery result: id=%s", outbox_id)
+
+
+async def outbox_worker_supervisor() -> None:
+    """Перезапускает outbox_worker при неожиданном завершении."""
+    while True:
+        try:
+            await outbox_worker()
+        except asyncio.CancelledError:
+            logging.info("Outbox worker supervisor cancelled")
+            raise
+        except Exception:
+            logging.exception("outbox_worker crashed, restarting in 10s")
+            await asyncio.sleep(10)
 
 
 async def check_live_signals() -> None:
@@ -840,9 +997,7 @@ async def check_live_signals() -> None:
             found_count += 1
             signal_id = await save_live_signal(sig)
             if signal_id > 0:
-                # Mark the candle only after the database confirms the signal was saved.
-                # Channel delivery retries are intentionally deferred to a persistent outbox
-                # implementation; retrying here without delivery state can duplicate posts.
+                # Mark the candle only after the database confirms the signal and outbox row were saved.
                 _LIVE_SIGNALS_SENT.add(key)
                 _LIVE_SIGNALS_ORDER.append(key)
 
@@ -850,24 +1005,22 @@ async def check_live_signals() -> None:
                     oldest_key = _LIVE_SIGNALS_ORDER.pop(0)
                     _LIVE_SIGNALS_SENT.discard(oldest_key)
 
-                sent = await notify_channel(sig)
-                if sent:
-                    logging.info("Live signal result: id=%s coin=%s channel_sent=True", signal_id, coin)
-                else:
-                    logging.warning(
-                        "Live signal saved but channel notification failed: id=%s coin=%s candle_time=%s",
-                        signal_id, coin, candle_time
-                    )
+                logging.info(
+                    "LIVE SIGNAL SAVED (outbox queued): id=%s coin=%s candle_time=%s",
+                    signal_id, coin, candle_time,
+                )
+                logging.info(
+                    "LIVE SIGNAL: coin=%s dir=%s entry=%.8f sl=%.8f tp=%.8f "
+                    "regime=%s candle_time=%s rr=%.2f reason=%s",
+                    coin, sig["direction"], sig["entry_price"], sig["sl_price"],
+                    sig["tp_price"], sig["regime"], sig["candle_time"],
+                    sig["rr"], sig["reason"]
+                )
             else:
-                logging.info("Live signal not saved/published: coin=%s candle_time=%s", coin, candle_time)
-
-            logging.info(
-                "LIVE SIGNAL: coin=%s dir=%s entry=%.8f sl=%.8f tp=%.8f "
-                "regime=%s candle_time=%s rr=%.2f reason=%s",
-                coin, sig["direction"], sig["entry_price"], sig["sl_price"],
-                sig["tp_price"], sig["regime"], sig["candle_time"],
-                sig["rr"], sig["reason"]
-            )
+                logging.info(
+                    "Live signal not saved (signal_id=%s; duplicate, cooldown, or DB error): coin=%s candle_time=%s",
+                    signal_id, coin, candle_time,
+                )
 
         except Exception:
             logging.exception("Live signals check failed for coin=%s", coin)
@@ -2115,8 +2268,9 @@ async def start_web_server():
 
 
 async def init_database() -> None:
-    """Подключается к PostgreSQL и создаёт базовую таблицу сигналов."""
-    global _DB_POOL
+    """Подключается к PostgreSQL и создаёт таблицы signals и outbox."""
+    global _DB_POOL, _OUTBOX_READY
+    _OUTBOX_READY = False
 
     if not DATABASE_URL:
         logging.warning("DATABASE_URL не задан — PostgreSQL отключён.")
@@ -2198,8 +2352,9 @@ async def init_database() -> None:
                     "Failed to ensure unique index for active live signals. "
                     "PostgreSQL remains available, but duplicate live signals may be possible."
                 )
-            # C4.3 Этап 2: отдельная таблица для надёжной доставки уведомлений.
-            # Ошибка миграции outbox не должна отключать основной пул PostgreSQL.
+            # Outbox is required for live signals: a signal and its delivery task
+            # must be committed atomically. Keep the DB pool available for diagnostics,
+            # but explicitly disable live signal writes if migration/validation fails.
             try:
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS outbox (
@@ -2225,15 +2380,31 @@ async def init_database() -> None:
                     CREATE INDEX IF NOT EXISTS idx_outbox_signal_id
                     ON outbox (signal_id)
                 """)
-                logging.info("Outbox table ensured.")
+                # CREATE TABLE IF NOT EXISTS does not repair an incompatible old table.
+                await conn.fetchval("""
+                    SELECT id, signal_id, kind, payload, status, attempts,
+                           last_error, next_attempt_at, sent_at, created_at
+                    FROM outbox
+                    LIMIT 0
+                """)
+                _OUTBOX_READY = True
+                logging.info("Outbox table and required columns are ready.")
             except Exception:
+                _OUTBOX_READY = False
                 logging.exception(
-                    "Failed to ensure outbox table. Bot continues without it."
+                    "CRITICAL: Outbox is not ready. Live signal writes are disabled "
+                    "until the schema problem is fixed."
                 )
 
             await conn.fetchval("SELECT 1")
-        logging.info("PostgreSQL подключён; таблица signals готова.")
+        if _OUTBOX_READY:
+            logging.info("PostgreSQL подключён; таблицы signals и outbox готовы.")
+        else:
+            logging.error(
+                "PostgreSQL подключён, но Outbox не готов: сохранение live-сигналов отключено."
+            )
     except Exception:
+        _OUTBOX_READY = False
         logging.exception("Не удалось подключиться к PostgreSQL; бот продолжит работу без БД.")
         if _DB_POOL is not None:
             await _DB_POOL.close()
@@ -2380,6 +2551,7 @@ async def main():
         dp.start_polling(bot),
         start_web_server(),
         market_data_supervisor(),
+        outbox_worker_supervisor(),
     )
 
 
