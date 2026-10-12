@@ -136,9 +136,9 @@ class OutboxWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_init_database_keeps_outbox_unready_after_migration_failure(self):
         conn = FakeConnection(fail_outbox_migration=True)
         pool = FakePool(conn)
-        with patch.object(bot, "DATABASE_URL", "postgresql://test"), \\
-             patch.object(bot.asyncpg, "create_pool", AsyncMock(return_value=pool)), \\
-             patch.object(bot, "_DB_POOL", None), \\
+        with patch.object(bot, "DATABASE_URL", "postgresql://test"), \
+             patch.object(bot.asyncpg, "create_pool", AsyncMock(return_value=pool)), \
+             patch.object(bot, "_DB_POOL", None), \
              patch.object(bot, "_OUTBOX_READY", True):
             await bot.init_database()
             self.assertFalse(bot._OUTBOX_READY)
