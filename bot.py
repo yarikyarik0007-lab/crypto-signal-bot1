@@ -47,7 +47,7 @@ LIVE_SIGNALS_INTERVAL_SECONDS = 15 * 60
 
 # C4.3 Этап 4: параметры обработки transactional outbox.
 OUTBOX_POLL_INTERVAL_SECONDS = 30
-OUTBOX_CLAIM_LEASE_SECONDS = 120
+OUTBOX_CLAIM_LEASE_SECONDS = 300
 OUTBOX_MAX_ATTEMPTS = 8
 OUTBOX_MAX_BACKOFF_SECONDS = 1800
 
@@ -824,6 +824,7 @@ async def outbox_worker() -> None:
                             SELECT id
                             FROM outbox
                             WHERE status = 'PENDING'
+                              AND kind = 'telegram_channel'
                               AND next_attempt_at <= NOW()
                             ORDER BY next_attempt_at, id
                             FOR UPDATE SKIP LOCKED
@@ -992,8 +993,8 @@ async def check_live_signals() -> None:
                 )
             else:
                 logging.info(
-                    "Live signal not saved (duplicate in DB or cooldown): coin=%s candle_time=%s",
-                    coin, candle_time,
+                    "Live signal not saved (signal_id=%s; duplicate, cooldown, or DB error): coin=%s candle_time=%s",
+                    signal_id, coin, candle_time,
                 )
 
             logging.info(
