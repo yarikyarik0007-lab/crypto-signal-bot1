@@ -116,12 +116,27 @@ class OutboxWorkerTests(unittest.IsolatedAsyncioTestCase):
             "sl_price": 101.0, "tp_price": 98.0, "rr": 2.0,
             "regime": "TREND_DOWN", "reason": "unit-test",
         }
-        with patch.object(bot, "_DB_POOL", FakePool(conn)):
+        with patch.object(bot, "_DB_POOL", FakePool(conn)), \\
+             patch.object(bot, "_OUTBOX_READY", True):
             result = await bot.save_live_signal(valid, source="live")
         self.assertEqual(result, -1)
         self.assertTrue(any("INSERT INTO signals" in q for q, _ in conn.fetchrow_calls))
         self.assertTrue(any("INSERT INTO outbox" in q for q, _ in conn.execute_calls))
         self.assertTrue(conn.rollback_observed)
+
+    async def test_live_signal_rejected_when_outbox_not_ready(self):
+        conn = FakeConnection()
+        valid = {
+            "coin": "BTC", "direction": "SHORT", "entry_price": 100.0,
+            "sl_price": 101.0, "tp_price": 98.0, "rr": 2.0,
+            "regime": "TREND_DOWN", "reason": "unit-test",
+        }
+        with patch.object(bot, "_DB_POOL", FakePool(conn)), \\
+             patch.object(bot, "_OUTBOX_READY", False):
+            result = await bot.save_live_signal(valid, source="live")
+        self.assertEqual(result, -1)
+        self.assertEqual(conn.fetchrow_calls, [])
+        self.assertEqual(conn.execute_calls, [])
 
     async def test_worker_marks_sent_on_success(self):
         conn = FakeConnection(task=task())
