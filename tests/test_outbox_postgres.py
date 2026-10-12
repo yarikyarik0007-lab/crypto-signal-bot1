@@ -121,7 +121,7 @@ async def test_two_real_connections_do_not_claim_same_locked_task(pg_env):
             WHERE status = 'PENDING' AND kind = 'telegram_channel'
               AND next_attempt_at <= NOW()
             ORDER BY next_attempt_at, id
-            FOR UPDATE SKIP LOCKED LIMIT 1
+            LIMIT 1 FOR UPDATE SKIP LOCKED
         )
         UPDATE outbox AS o
         SET attempts = o.attempts + 1,
