@@ -4,12 +4,12 @@ Run with TEST_DATABASE_URL set to a disposable PostgreSQL database. These tests
 use a dedicated temporary schema and never connect to production unless that URL
 is explicitly supplied by the caller.
 """
-import asyncio
 import os
 import uuid
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 import bot
 
@@ -20,7 +20,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def pg_env():
     admin = await asyncpg.connect(TEST_DATABASE_URL)
     schema = "outbox_test_" + uuid.uuid4().hex[:12]
@@ -134,7 +134,7 @@ async def test_two_real_connections_do_not_claim_same_locked_task(pg_env):
         async with first.transaction():
             first_id = await first.fetchval(claim_sql, 300)
             assert first_id is not None
-            # The first transaction deliberately holds its row lock here.
+            # Keep the first row lock while a second independent connection claims.
             second_id = await second.fetchval(claim_sql, 300)
             assert second_id is None
 
