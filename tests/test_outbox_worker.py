@@ -162,6 +162,7 @@ class OutboxWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("FOR UPDATE SKIP LOCKED", claim_query)
         self.assertIn("LIMIT 1", claim_query)
         self.assertIn("kind = 'telegram_channel'", claim_query)
+        self.assertEqual(conn.fetchrow_calls[0][1], (300,))
         self.assertEqual(sum("WITH candidate AS" in q for q, _ in conn.fetchrow_calls), 2)
         # This is a single fake connection/worker simulation, not a real concurrency test.
 
