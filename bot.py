@@ -45,6 +45,12 @@ _LIVE_SIGNALS_ORDER: list[str] = []
 LIVE_SIGNALS_MAX_HISTORY = 1000
 LIVE_SIGNALS_INTERVAL_SECONDS = 15 * 60
 
+# C4.3 Этап 4: параметры обработки transactional outbox.
+OUTBOX_POLL_INTERVAL_SECONDS = 30
+OUTBOX_CLAIM_LEASE_SECONDS = 120
+OUTBOX_MAX_ATTEMPTS = 8
+OUTBOX_MAX_BACKOFF_SECONDS = 1800
+
 
 
 
@@ -797,6 +803,118 @@ async def notify_channel(sig: dict) -> bool:
     except Exception:
         logging.exception("notify_channel failed")
         return False
+
+
+async def outbox_worker() -> None:
+    """Доставляет PENDING-задачи Outbox с ограниченными повторами и backoff."""
+    while True:
+        if _DB_POOL is None:
+            await asyncio.sleep(OUTBOX_POLL_INTERVAL_SECONDS)
+            continue
+
+        task = None
+        try:
+            # Короткая транзакция атомарно забирает одну задачу.
+            # Lease не даёт другому worker забрать её, пока выполняется отправка.
+            async with _DB_POOL.acquire() as conn:
+                async with conn.transaction():
+                    task = await conn.fetchrow(
+                        """
+                        WITH candidate AS (
+                            SELECT id
+                            FROM outbox
+                            WHERE status = 'PENDING'
+                              AND next_attempt_at <= NOW()
+                            ORDER BY next_attempt_at, id
+                            FOR UPDATE SKIP LOCKED
+                            LIMIT 1
+                        )
+                        UPDATE outbox AS o
+                        SET attempts = o.attempts + 1,
+                            next_attempt_at = NOW() + ($1::int * INTERVAL '1 second')
+                        FROM candidate
+                        WHERE o.id = candidate.id
+                        RETURNING o.id, o.signal_id, o.payload, o.attempts
+                        """,
+                        OUTBOX_CLAIM_LEASE_SECONDS,
+                    )
+        except Exception:
+            logging.exception("Outbox worker failed to claim a task")
+            await asyncio.sleep(OUTBOX_POLL_INTERVAL_SECONDS)
+            continue
+
+        if task is None:
+            await asyncio.sleep(OUTBOX_POLL_INTERVAL_SECONDS)
+            continue
+
+        outbox_id = int(task["id"])
+        attempts = int(task["attempts"])
+        error_text = None
+        sent = False
+
+        try:
+            payload = task["payload"]
+            # asyncpg обычно возвращает JSONB как str без пользовательского codec.
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            if not isinstance(payload, dict):
+                raise ValueError("Outbox payload must be a JSON object")
+            sent = await notify_channel(payload)
+            if not sent:
+                raise RuntimeError("notify_channel returned False")
+        except Exception as exc:
+            error_text = str(exc)[:2000]
+            logging.warning(
+                "Outbox delivery failed: id=%s signal_id=%s attempt=%s error=%s",
+                outbox_id, task["signal_id"], attempts, error_text,
+            )
+
+        try:
+            async with _DB_POOL.acquire() as conn:
+                if sent:
+                    await conn.execute(
+                        """
+                        UPDATE outbox
+                        SET status = 'SENT',
+                            sent_at = NOW(),
+                            last_error = NULL
+                        WHERE id = $1 AND status = 'PENDING'
+                        """,
+                        outbox_id,
+                    )
+                    logging.info(
+                        "Outbox delivery succeeded: id=%s signal_id=%s attempts=%s",
+                        outbox_id, task["signal_id"], attempts,
+                    )
+                else:
+                    if attempts >= OUTBOX_MAX_ATTEMPTS:
+                        status = "FAILED"
+                        delay_seconds = 0
+                    else:
+                        status = "PENDING"
+                        delay_seconds = min(
+                            30 * (2 ** max(0, attempts - 1)),
+                            OUTBOX_MAX_BACKOFF_SECONDS,
+                        )
+                    await conn.execute(
+                        """
+                        UPDATE outbox
+                        SET status = $2,
+                            last_error = $3,
+                            next_attempt_at = NOW() + ($4::int * INTERVAL '1 second')
+                        WHERE id = $1 AND status = 'PENDING'
+                        """,
+                        outbox_id, status, error_text or "Unknown delivery error",
+                        delay_seconds,
+                    )
+                    logging.info(
+                        "Outbox task rescheduled: id=%s status=%s attempts=%s delay_seconds=%s",
+                        outbox_id, status, attempts, delay_seconds,
+                    )
+        except Exception:
+            # Если Telegram принял сообщение, а запись SENT не сохранилась,
+            # задача может быть отправлена повторно после lease. Это at-least-once delivery.
+            logging.exception("Outbox worker failed to persist delivery result: id=%s", outbox_id)
 
 
 async def check_live_signals() -> None:
@@ -2397,6 +2515,7 @@ async def main():
         dp.start_polling(bot),
         start_web_server(),
         market_data_supervisor(),
+        outbox_worker(),
     )
 
 
