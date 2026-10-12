@@ -74,6 +74,11 @@ def valid_signal(direction="SHORT"):
 
 
 class LiveSignalValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.outbox_ready_patcher = patch.object(bot, "_OUTBOX_READY", True)
+        self.outbox_ready_patcher.start()
+        self.addCleanup(self.outbox_ready_patcher.stop)
+
     def test_valid_short_is_saved_and_source_is_passed(self):
         conn = FakeConnection(inserted_id=123)
         with patch.object(bot, "_DB_POOL", FakePool(conn)):
