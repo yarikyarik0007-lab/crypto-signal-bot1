@@ -2198,6 +2198,39 @@ async def init_database() -> None:
                     "Failed to ensure unique index for active live signals. "
                     "PostgreSQL remains available, but duplicate live signals may be possible."
                 )
+            # C4.3 Этап 2: отдельная таблица для надёжной доставки уведомлений.
+            # Ошибка миграции outbox не должна отключать основной пул PostgreSQL.
+            try:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS outbox (
+                        id BIGSERIAL PRIMARY KEY,
+                        signal_id BIGINT NOT NULL,
+                        kind TEXT NOT NULL DEFAULT 'telegram_channel',
+                        payload JSONB NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'PENDING'
+                            CHECK (status IN ('PENDING', 'SENT', 'FAILED')),
+                        attempts INT NOT NULL DEFAULT 0,
+                        last_error TEXT,
+                        next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        sent_at TIMESTAMPTZ,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_outbox_pending
+                    ON outbox (next_attempt_at)
+                    WHERE status = 'PENDING'
+                """)
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_outbox_signal_id
+                    ON outbox (signal_id)
+                """)
+                logging.info("Outbox table ensured.")
+            except Exception:
+                logging.exception(
+                    "Failed to ensure outbox table. Bot continues without it."
+                )
+
             await conn.fetchval("SELECT 1")
         logging.info("PostgreSQL подключён; таблица signals готова.")
     except Exception:
