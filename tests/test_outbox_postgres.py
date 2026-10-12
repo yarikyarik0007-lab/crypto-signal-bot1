@@ -95,11 +95,14 @@ async def test_real_transaction_rolls_back_signal_if_outbox_insert_fails(pg_env)
         """)
 
     previous_pool = bot._DB_POOL
+    previous_outbox_ready = bot._OUTBOX_READY
     bot._DB_POOL = pool
+    bot._OUTBOX_READY = True
     try:
         assert await bot.save_live_signal(valid_signal(), source="live") == -1
     finally:
         bot._DB_POOL = previous_pool
+        bot._OUTBOX_READY = previous_outbox_ready
 
     async with pool.acquire() as conn:
         assert await conn.fetchval("SELECT COUNT(*) FROM signals") == 0
