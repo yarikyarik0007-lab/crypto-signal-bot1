@@ -104,6 +104,7 @@ class LiveSignalDiagnosticsTests(unittest.TestCase):
 
     def test_latest_short_breakout_with_volume_is_not_confused_with_history(self):
         data = candles()
+        data[70].update({"o": 100.0, "h": 100.2, "l": 98.8, "c": 99.0, "v": 100.0})
         data[-1].update({"o": 100.0, "h": 100.2, "l": 98.8, "c": 99.0, "v": 100.0})
         diagnostics = {}
 
