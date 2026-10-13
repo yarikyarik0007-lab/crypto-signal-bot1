@@ -552,8 +552,13 @@ def run_backtest(candles: list[dict], zone_lookback=BT_ZONE_LOOKBACK, rr_target=
 def evaluate_last_candle(candles: list[dict], diagnostics: dict | None = None) -> dict | None:
     """Checks the existing live SHORT strategy; optional counters explain rejected setups."""
     stats = diagnostics if diagnostics is not None else {}
+    stats.setdefault("history", {})
+    stats.setdefault("latest_stats", {})
+    diagnostic_index = -1
+
     def count(key: str) -> None:
-        stats[key] = stats.get(key, 0) + 1
+        bucket = stats["latest_stats"] if diagnostic_index == len(candles) - 1 else stats["history"]
+        bucket[key] = bucket.get(key, 0) + 1
 
     if not candles:
         stats["result"] = "no_candles"
@@ -570,10 +575,37 @@ def evaluate_last_candle(candles: list[dict], diagnostics: dict | None = None) -
         stats["result"] = "missing_last_candle_timestamp"
         return None
 
+    latest = candles[last_idx]
+    latest_support = find_pivot_level(candles, last_idx, BT_ZONE_LOOKBACK, "low")
+    latest_resistance = find_pivot_level(candles, last_idx, BT_ZONE_LOOKBACK, "high")
+    recent_volumes = [c["v"] for c in candles[max(0, last_idx - 10):last_idx]]
+    latest_avg_volume = sum(recent_volumes) / len(recent_volumes) if recent_volumes else 0
+    latest_vol_ok = latest_avg_volume == 0 or latest["v"] >= latest_avg_volume
+    latest_regime = classify_regime(candles, last_idx)
+
+    def distance_pct(price: float, level: float | None) -> float | None:
+        if level is None or level == 0:
+            return None
+        return (price - level) / level * 100
+
+    latest_short_breakout = bool(latest_support and latest["c"] < latest_support * (1 - BT_BREAKOUT_MARGIN))
+    latest_long_breakout = bool(latest_resistance and latest["c"] > latest_resistance * (1 + BT_BREAKOUT_MARGIN))
+    stats["latest"] = {
+        "candle_time": candle_time, "regime": latest_regime,
+        "volume": latest.get("v"), "avg_volume_10": latest_avg_volume, "vol_ok": latest_vol_ok,
+        "support": latest_support, "resistance": latest_resistance,
+        "distance_to_support_pct": distance_pct(latest["c"], latest_support),
+        "distance_to_resistance_pct": distance_pct(latest["c"], latest_resistance),
+        "short_breakout": latest_short_breakout, "short_breakout_vol_ok": latest_short_breakout and latest_vol_ok,
+        "long_breakout": latest_long_breakout, "long_breakout_vol_ok": latest_long_breakout and latest_vol_ok,
+        "result": "evaluating_latest_candle",
+    }
+
     pending: list[dict] = []
     i = BT_ZONE_LOOKBACK + BT_PIVOT_WINDOW + 2
 
     while i <= last_idx:
+        diagnostic_index = i
         sig = candles[i]
         pending = [p for p in pending if i - p["breakout_i"] <= BT_RETEST_WINDOW]
 
@@ -620,6 +652,8 @@ def evaluate_last_candle(candles: list[dict], diagnostics: dict | None = None) -
                     return None
                 tp = entry - BT_RR_TARGET * risk
                 stats["result"] = "signal_found"
+                stats["latest"]["result"] = "signal_found"
+                stats["latest"]["signal"] = {"direction": "SHORT", "entry_price": entry, "sl_price": sl, "tp_price": tp, "rr": BT_RR_TARGET}
                 return {
                     "direction": "SHORT",
                     "level": level,
@@ -659,10 +693,22 @@ def evaluate_last_candle(candles: list[dict], diagnostics: dict | None = None) -
             if exit_i is None:
                 count("historical_retest_unresolved")
                 stats["result"] = "historical_setup_unresolved"
+                stats["blocking_setup"] = {
+                    "status": "unresolved", "direction": direction,
+                    "trigger_candle_time": sig.get("t"), "age_candles": last_idx - i,
+                    "entry_price": entry, "sl_price": sl, "tp_price": tp,
+                }
+                stats["latest"]["result"] = "blocked_by_historical_setup_unresolved"
                 return None
             if exit_i >= last_idx:
                 count("historical_retest_exited_on_latest_candle")
                 stats["result"] = "historical_setup_exited_on_latest_candle"
+                stats["blocking_setup"] = {
+                    "status": "exited_on_latest_candle", "direction": direction,
+                    "trigger_candle_time": sig.get("t"), "age_candles": last_idx - i,
+                    "entry_price": entry, "sl_price": sl, "tp_price": tp,
+                }
+                stats["latest"]["result"] = "blocked_by_historical_setup_exit_on_latest"
                 return None
 
             count("historical_retest_not_latest")
@@ -701,16 +747,25 @@ def evaluate_last_candle(candles: list[dict], diagnostics: dict | None = None) -
 
         i += 1
 
-    if stats.get("retest_triggered"):
-        stats["result"] = "retest_seen_but_no_latest_valid_signal"
-    elif stats.get("breakout_detected_short"):
-        stats["result"] = "short_breakout_seen_but_no_valid_retest"
-    elif stats.get("breakout_rejected_volume_short"):
-        stats["result"] = "short_breakout_rejected_by_volume"
-    elif stats.get("breakout_detected_long"):
-        stats["result"] = "only_long_breakouts_detected_but_strategy_is_short_only"
+    latest_stats = stats["latest_stats"]
+    if latest_stats.get("retest_triggered"):
+        result = "latest_retest_rejected_or_not_signal"
+    elif latest_stats.get("breakout_detected_short"):
+        result = "latest_short_breakout_seen_but_no_valid_retest"
+    elif latest_stats.get("breakout_rejected_volume_short"):
+        result = "latest_short_breakout_rejected_by_volume"
+    elif latest_stats.get("breakout_detected_long"):
+        result = "latest_only_long_breakout_but_strategy_is_short_only"
+    elif latest_short_breakout and not latest_vol_ok:
+        result = "latest_short_breakout_rejected_by_volume"
+    elif latest_short_breakout:
+        result = "latest_short_breakout_seen_but_no_valid_retest"
+    elif latest_long_breakout:
+        result = "latest_only_long_breakout_but_strategy_is_short_only"
     else:
-        stats["result"] = "no_qualifying_breakout"
+        result = "latest_no_qualifying_breakout"
+    stats["latest"]["result"] = result
+    stats["result"] = result
     return None
 
 
