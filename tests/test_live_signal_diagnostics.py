@@ -138,5 +138,91 @@ class LiveSignalDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diagnostics["latest_stats"].get("breakout_detected_long"), 1)
 
 
+    def test_latest_short_retest_in_downtrend_returns_signal_with_two_to_one_rr(self):
+        data = candles()
+        data[-2].update({"o": 100.0, "h": 100.2, "l": 98.8, "c": 99.0, "v": 100.0})
+        data[-1].update({"o": 100.2, "h": 100.1, "l": 99.2, "c": 99.5, "v": 100.0})
+        diagnostics = {}
+
+        def fixed_level(_candles, _index, _lookback, kind):
+            return 100.0 if kind == "low" else 110.0
+
+        with patch.object(bot, "find_pivot_level", side_effect=fixed_level), \\
+             patch.object(bot, "classify_regime", return_value="TREND_DOWN"):
+            result = bot.evaluate_last_candle(data, diagnostics)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["direction"], "SHORT")
+        self.assertEqual(result["regime"], "TREND_DOWN")
+        self.assertGreater(result["sl_price"], result["entry_price"])
+        self.assertLess(result["tp_price"], result["entry_price"])
+        self.assertAlmostEqual(
+            (result["entry_price"] - result["tp_price"]) /
+            (result["sl_price"] - result["entry_price"]),
+            2.0,
+        )
+        self.assertEqual(diagnostics["result"], "signal_found")
+
+    def test_latest_short_retest_is_rejected_outside_downtrend(self):
+        data = candles()
+        data[-2].update({"o": 100.0, "h": 100.2, "l": 98.8, "c": 99.0, "v": 100.0})
+        data[-1].update({"o": 100.2, "h": 100.1, "l": 99.2, "c": 99.5, "v": 100.0})
+        diagnostics = {}
+
+        def fixed_level(_candles, _index, _lookback, kind):
+            return 100.0 if kind == "low" else 110.0
+
+        with patch.object(bot, "find_pivot_level", side_effect=fixed_level), \\
+             patch.object(
+                 bot, "classify_regime",
+                 side_effect=["TREND_DOWN", "TREND_UP"],
+             ):
+            result = bot.evaluate_last_candle(data, diagnostics)
+
+        self.assertIsNone(result)
+        self.assertEqual(diagnostics["latest_stats"].get("retest_triggered"), 1)
+        self.assertEqual(diagnostics["latest_stats"].get("retest_rejected_regime_TREND_UP"), 1)
+        self.assertEqual(diagnostics["result"], "latest_retest_rejected_or_not_signal")
+
+    def test_latest_long_retest_is_rejected_by_short_only_strategy(self):
+        data = candles()
+        data[-2].update({"o": 100.0, "h": 112.0, "l": 99.8, "c": 111.0, "v": 100.0})
+        data[-1].update({"o": 110.0, "h": 110.2, "l": 99.8, "c": 110.5, "v": 100.0})
+        diagnostics = {}
+
+        def fixed_level(_candles, _index, _lookback, kind):
+            return 90.0 if kind == "low" else 100.0
+
+        with patch.object(bot, "find_pivot_level", side_effect=fixed_level), \\
+             patch.object(bot, "classify_regime", return_value="TREND_DOWN"):
+            result = bot.evaluate_last_candle(data, diagnostics)
+
+        self.assertIsNone(result)
+        self.assertEqual(diagnostics["latest_stats"].get("retest_triggered"), 1)
+        self.assertEqual(diagnostics["latest_stats"].get("retest_rejected_direction"), 1)
+        self.assertEqual(diagnostics["result"], "latest_retest_rejected_or_not_signal")
+
+    def test_unresolved_historical_retest_is_reported_as_blocking_latest_signal(self):
+        data = candles()
+        data[80].update({"o": 100.0, "h": 100.2, "l": 98.8, "c": 99.0, "v": 100.0})
+        data[81].update({"o": 100.0, "h": 100.1, "l": 99.3, "c": 99.5, "v": 100.0})
+        for candle in data[82:]:
+            candle.update({"o": 100.0, "h": 100.2, "l": 99.8, "c": 100.0, "v": 100.0})
+        diagnostics = {}
+
+        def fixed_level(_candles, _index, _lookback, kind):
+            return 100.0 if kind == "low" else 110.0
+
+        with patch.object(bot, "find_pivot_level", side_effect=fixed_level), \\
+             patch.object(bot, "classify_regime", return_value="TREND_DOWN"):
+            result = bot.evaluate_last_candle(data, diagnostics)
+
+        self.assertIsNone(result)
+        self.assertEqual(diagnostics["result"], "historical_setup_unresolved")
+        self.assertEqual(diagnostics["latest"]["result"], "blocked_by_historical_setup_unresolved")
+        self.assertEqual(diagnostics["blocking_setup"]["status"], "unresolved")
+        self.assertEqual(diagnostics["history"].get("historical_retest_unresolved"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
