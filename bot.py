@@ -756,19 +756,19 @@ def evaluate_last_candle(candles: list[dict], diagnostics: dict | None = None) -
         i += 1
 
     latest_stats = stats["latest_stats"]
+    # Prefer the most actionable reason for the latest candle. Retest evaluation
+    # happens before breakout detection, so it takes precedence when it triggered.
     if latest_stats.get("retest_triggered"):
         result = "latest_retest_rejected_or_not_signal"
-    elif latest_stats.get("breakout_detected_short"):
-        result = "latest_short_breakout_seen_but_no_valid_retest"
-    elif latest_stats.get("breakout_rejected_volume_short"):
+    elif latest_stats.get("breakout_rejected_volume_short") or (
+        latest_short_breakout and not latest_vol_ok
+    ):
         result = "latest_short_breakout_rejected_by_volume"
-    elif latest_stats.get("breakout_detected_long"):
-        result = "latest_only_long_breakout_but_strategy_is_short_only"
-    elif latest_short_breakout and not latest_vol_ok:
-        result = "latest_short_breakout_rejected_by_volume"
-    elif latest_short_breakout:
+    elif latest_stats.get("breakout_detected_short") or latest_short_breakout:
         result = "latest_short_breakout_seen_but_no_valid_retest"
-    elif latest_long_breakout:
+    elif latest_long_breakout and not latest_vol_ok:
+        result = "latest_long_breakout_rejected_by_volume"
+    elif latest_stats.get("breakout_detected_long") or latest_long_breakout:
         result = "latest_only_long_breakout_but_strategy_is_short_only"
     else:
         result = "latest_no_qualifying_breakout"
