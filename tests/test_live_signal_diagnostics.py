@@ -60,6 +60,48 @@ class LiveSignalDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diagnostics["result"], "latest_no_qualifying_breakout")
         self.assertEqual(diagnostics["latest"]["result"], diagnostics["result"])
 
+    def test_latest_short_breakout_rejected_by_volume_is_distinguished(self):
+        data = candles()
+        data[-1].update({"o": 100.0, "h": 100.2, "l": 98.8, "c": 99.0, "v": 1.0})
+        diagnostics = {}
+
+        def fixed_level(_candles, _index, _lookback, kind):
+            return 100.0 if kind == "low" else 110.0
+
+        with patch.object(bot, "find_pivot_level", side_effect=fixed_level), \\
+             patch.object(bot, "classify_regime", return_value="TREND_DOWN"):
+            result = bot.evaluate_last_candle(data, diagnostics)
+
+        self.assertIsNone(result)
+        self.assertTrue(diagnostics["latest"]["short_breakout"])
+        self.assertFalse(diagnostics["latest"]["vol_ok"])
+        self.assertEqual(
+            diagnostics["latest"]["result"],
+            "latest_short_breakout_rejected_by_volume",
+        )
+        self.assertEqual(
+            diagnostics["latest_stats"].get("breakout_rejected_volume_short"),
+            1,
+        )
+
+    def test_diagnostics_counters_are_reset_when_dict_is_reused(self):
+        data = candles()
+        diagnostics = {
+            "history": {"breakout_detected_short": 999},
+            "latest_stats": {"breakout_detected_short": 999},
+            "blocking_setup": {"status": "stale"},
+        }
+
+        with patch.object(bot, "find_pivot_level", return_value=None), \\
+             patch.object(bot, "classify_regime", return_value="TREND_DOWN"):
+            result = bot.evaluate_last_candle(data, diagnostics)
+
+        self.assertIsNone(result)
+        self.assertEqual(diagnostics["history"], {})
+        self.assertEqual(diagnostics["latest_stats"], {})
+        self.assertNotIn("blocking_setup", diagnostics)
+        self.assertEqual(diagnostics["latest"]["result"], "latest_no_qualifying_breakout")
+
 
 if __name__ == "__main__":
     unittest.main()
