@@ -224,5 +224,30 @@ class LiveSignalDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diagnostics["history"].get("historical_retest_unresolved"), 1)
 
 
+    def test_latest_long_breakout_rejected_by_volume_is_not_mislabeled_short_only(self):
+        data = candles()
+        data[-1].update({"o": 100.0, "h": 112.0, "l": 99.8, "c": 111.0, "v": 1.0})
+        diagnostics = {}
+
+        def fixed_level(_candles, _index, _lookback, kind):
+            return 90.0 if kind == "low" else 100.0
+
+        with patch.object(bot, "find_pivot_level", side_effect=fixed_level), \\
+             patch.object(bot, "classify_regime", return_value="TREND_DOWN"):
+            result = bot.evaluate_last_candle(data, diagnostics)
+
+        self.assertIsNone(result)
+        self.assertTrue(diagnostics["latest"]["long_breakout"])
+        self.assertFalse(diagnostics["latest"]["vol_ok"])
+        self.assertEqual(
+            diagnostics["result"],
+            "latest_long_breakout_rejected_by_volume",
+        )
+        self.assertEqual(
+            diagnostics["latest_stats"].get("breakout_rejected_volume_long"),
+            1,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
