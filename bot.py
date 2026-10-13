@@ -552,8 +552,10 @@ def run_backtest(candles: list[dict], zone_lookback=BT_ZONE_LOOKBACK, rr_target=
 def evaluate_last_candle(candles: list[dict], diagnostics: dict | None = None) -> dict | None:
     """Checks the existing live SHORT strategy; optional counters explain rejected setups."""
     stats = diagnostics if diagnostics is not None else {}
-    stats.setdefault("history", {})
-    stats.setdefault("latest_stats", {})
+    # Each evaluation must start with clean counters; callers may reuse a dict.
+    stats["history"] = {}
+    stats["latest_stats"] = {}
+    stats.pop("blocking_setup", None)
     diagnostic_index = -1
 
     def count(key: str) -> None:
@@ -649,6 +651,11 @@ def evaluate_last_candle(candles: list[dict], diagnostics: dict | None = None) -
                 if risk <= 0:
                     count("retest_rejected_invalid_risk")
                     stats["result"] = "invalid_risk_on_latest_candle"
+                    stats["latest"]["result"] = "invalid_risk_on_latest_candle"
+                    stats["latest"]["rejected_signal"] = {
+                        "direction": "SHORT", "entry_price": entry,
+                        "sl_price": sl, "risk": risk,
+                    }
                     return None
                 tp = entry - BT_RR_TARGET * risk
                 stats["result"] = "signal_found"
