@@ -68,7 +68,7 @@ class LiveSignalDiagnosticsTests(unittest.TestCase):
         def fixed_level(_candles, _index, _lookback, kind):
             return 100.0 if kind == "low" else 110.0
 
-        with patch.object(bot, "find_pivot_level", side_effect=fixed_level), \\
+        with patch.object(bot, "find_pivot_level", side_effect=fixed_level), \
              patch.object(bot, "classify_regime", return_value="TREND_DOWN"):
             result = bot.evaluate_last_candle(data, diagnostics)
 
@@ -92,7 +92,7 @@ class LiveSignalDiagnosticsTests(unittest.TestCase):
             "blocking_setup": {"status": "stale"},
         }
 
-        with patch.object(bot, "find_pivot_level", return_value=None), \\
+        with patch.object(bot, "find_pivot_level", return_value=None), \
              patch.object(bot, "classify_regime", return_value="TREND_DOWN"):
             result = bot.evaluate_last_candle(data, diagnostics)
 
@@ -111,7 +111,7 @@ class LiveSignalDiagnosticsTests(unittest.TestCase):
         def fixed_level(_candles, _index, _lookback, kind):
             return 100.0 if kind == "low" else 110.0
 
-        with patch.object(bot, "find_pivot_level", side_effect=fixed_level), \\
+        with patch.object(bot, "find_pivot_level", side_effect=fixed_level), \
              patch.object(bot, "classify_regime", return_value="TREND_DOWN"):
             result = bot.evaluate_last_candle(data, diagnostics)
 
@@ -128,7 +128,7 @@ class LiveSignalDiagnosticsTests(unittest.TestCase):
         def fixed_level(_candles, _index, _lookback, kind):
             return 90.0 if kind == "low" else 100.0
 
-        with patch.object(bot, "find_pivot_level", side_effect=fixed_level), \\
+        with patch.object(bot, "find_pivot_level", side_effect=fixed_level), \
              patch.object(bot, "classify_regime", return_value="TREND_DOWN"):
             result = bot.evaluate_last_candle(data, diagnostics)
 
