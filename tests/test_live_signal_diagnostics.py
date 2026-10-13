@@ -1,0 +1,65 @@
+import unittest
+from unittest.mock import patch
+
+import bot
+
+
+def candles(count=100):
+    rows = []
+    for i in range(count):
+        rows.append({
+            "t": i + 1,
+            "o": 100.0,
+            "h": 101.0,
+            "l": 99.0,
+            "c": 100.0,
+            "v": 100.0,
+        })
+    return rows
+
+
+class LiveSignalDiagnosticsTests(unittest.TestCase):
+    def test_empty_and_insufficient_candles_keep_existing_guard_results(self):
+        diagnostics = {}
+        self.assertIsNone(bot.evaluate_last_candle([], diagnostics))
+        self.assertEqual(diagnostics["result"], "no_candles")
+
+        diagnostics = {}
+        self.assertIsNone(bot.evaluate_last_candle(candles(99), diagnostics))
+        self.assertEqual(diagnostics["result"], "insufficient_candles")
+
+    def test_missing_latest_timestamp_is_reported(self):
+        data = candles()
+        data[-1]["t"] = None
+        diagnostics = {}
+        with patch.object(bot, "classify_regime", return_value="TREND_DOWN"):
+            self.assertIsNone(bot.evaluate_last_candle(data, diagnostics))
+        self.assertEqual(diagnostics["result"], "missing_last_candle_timestamp")
+
+    def test_old_breakout_does_not_become_latest_candle_reason(self):
+        data = candles()
+        # An old short breakout; the final candle is not a breakout.
+        data[70]["o"] = 100.0
+        data[70]["c"] = 99.0
+        data[70]["h"] = 100.0
+        data[70]["l"] = 98.0
+        diagnostics = {}
+
+        def fixed_level(_candles, _index, _lookback, kind):
+            return 100.0 if kind == "low" else 110.0
+
+        with patch.object(bot, "find_pivot_level", side_effect=fixed_level), \
+             patch.object(bot, "classify_regime", return_value="TREND_DOWN"):
+            result = bot.evaluate_last_candle(data, diagnostics)
+
+        self.assertIsNone(result)
+        self.assertIn("breakout_detected_short", diagnostics["history"])
+        self.assertNotIn("breakout_detected_short", diagnostics["latest_stats"])
+        self.assertEqual(diagnostics["latest"]["candle_time"], data[-1]["t"])
+        self.assertFalse(diagnostics["latest"]["short_breakout"])
+        self.assertEqual(diagnostics["result"], "latest_no_qualifying_breakout")
+        self.assertEqual(diagnostics["latest"]["result"], diagnostics["result"])
+
+
+if __name__ == "__main__":
+    unittest.main()
