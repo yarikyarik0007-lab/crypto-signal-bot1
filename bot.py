@@ -555,6 +555,7 @@ def evaluate_last_candle(candles: list[dict], diagnostics: dict | None = None) -
     # Each evaluation must start with clean counters; callers may reuse a dict.
     stats["history"] = {}
     stats["latest_stats"] = {}
+    stats.pop("latest", None)
     stats.pop("blocking_setup", None)
     diagnostic_index = -1
 
