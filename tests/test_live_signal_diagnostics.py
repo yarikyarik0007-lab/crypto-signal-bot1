@@ -102,6 +102,40 @@ class LiveSignalDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("blocking_setup", diagnostics)
         self.assertEqual(diagnostics["latest"]["result"], "latest_no_qualifying_breakout")
 
+    def test_latest_short_breakout_with_volume_is_not_confused_with_history(self):
+        data = candles()
+        data[-1].update({"o": 100.0, "h": 100.2, "l": 98.8, "c": 99.0, "v": 100.0})
+        diagnostics = {}
+
+        def fixed_level(_candles, _index, _lookback, kind):
+            return 100.0 if kind == "low" else 110.0
+
+        with patch.object(bot, "find_pivot_level", side_effect=fixed_level), \\
+             patch.object(bot, "classify_regime", return_value="TREND_DOWN"):
+            result = bot.evaluate_last_candle(data, diagnostics)
+
+        self.assertIsNone(result)
+        self.assertEqual(diagnostics["latest"]["result"], "latest_short_breakout_seen_but_no_valid_retest")
+        self.assertEqual(diagnostics["latest_stats"].get("breakout_detected_short"), 1)
+        self.assertGreater(diagnostics["history"].get("breakout_detected_short", 0), 0)
+
+    def test_latest_long_breakout_reports_short_only_strategy_rejection(self):
+        data = candles()
+        data[-1].update({"o": 100.0, "h": 112.0, "l": 99.8, "c": 111.0, "v": 100.0})
+        diagnostics = {}
+
+        def fixed_level(_candles, _index, _lookback, kind):
+            return 90.0 if kind == "low" else 100.0
+
+        with patch.object(bot, "find_pivot_level", side_effect=fixed_level), \\
+             patch.object(bot, "classify_regime", return_value="TREND_DOWN"):
+            result = bot.evaluate_last_candle(data, diagnostics)
+
+        self.assertIsNone(result)
+        self.assertTrue(diagnostics["latest"]["long_breakout"])
+        self.assertEqual(diagnostics["latest"]["result"], "latest_only_long_breakout_but_strategy_is_short_only")
+        self.assertEqual(diagnostics["latest_stats"].get("breakout_detected_long"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
