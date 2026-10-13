@@ -549,15 +549,25 @@ def run_backtest(candles: list[dict], zone_lookback=BT_ZONE_LOOKBACK, rr_target=
     return trades
 
 
-def evaluate_last_candle(candles: list[dict]) -> dict | None:
-    """C4.1: проверяет live-сигнал TREND_DOWN + SHORT на последней свече."""
-    if not candles or len(candles) < 100:
+def evaluate_last_candle(candles: list[dict], diagnostics: dict | None = None) -> dict | None:
+    """Checks the existing live SHORT strategy; optional counters explain rejected setups."""
+    stats = diagnostics if diagnostics is not None else {}
+    def count(key: str) -> None:
+        stats[key] = stats.get(key, 0) + 1
+
+    if not candles:
+        stats["result"] = "no_candles"
+        return None
+    if len(candles) < 100:
+        stats["result"] = "insufficient_candles"
+        stats["closed_candles"] = len(candles)
         return None
 
     n = len(candles)
     last_idx = n - 1
     candle_time = candles[last_idx].get("t")
     if candle_time is None:
+        stats["result"] = "missing_last_candle_timestamp"
         return None
 
     pending: list[dict] = []
@@ -565,10 +575,7 @@ def evaluate_last_candle(candles: list[dict]) -> dict | None:
 
     while i <= last_idx:
         sig = candles[i]
-        pending = [
-            p for p in pending
-            if i - p["breakout_i"] <= BT_RETEST_WINDOW
-        ]
+        pending = [p for p in pending if i - p["breakout_i"] <= BT_RETEST_WINDOW]
 
         triggered = None
         for p in pending:
@@ -588,12 +595,18 @@ def evaluate_last_candle(candles: list[dict]) -> dict | None:
                     break
 
         if triggered is not None:
+            count("retest_triggered")
             pending = [p for p in pending if p is not triggered]
             direction = triggered["dir"]
             level = triggered["level"]
             regime = classify_regime(candles, i)
 
-            if regime != "TREND_DOWN" or direction != "SHORT":
+            if direction != "SHORT":
+                count("retest_rejected_direction")
+                i += 1
+                continue
+            if regime != "TREND_DOWN":
+                count("retest_rejected_regime_" + str(regime))
                 i += 1
                 continue
 
@@ -602,8 +615,11 @@ def evaluate_last_candle(candles: list[dict]) -> dict | None:
                 sl = max(level * (1 + 0.005), sig["h"] * 1.002)
                 risk = sl - entry
                 if risk <= 0:
+                    count("retest_rejected_invalid_risk")
+                    stats["result"] = "invalid_risk_on_latest_candle"
                     return None
                 tp = entry - BT_RR_TARGET * risk
+                stats["result"] = "signal_found"
                 return {
                     "direction": "SHORT",
                     "level": level,
@@ -617,12 +633,14 @@ def evaluate_last_candle(candles: list[dict]) -> dict | None:
                 }
 
             if i + 1 > last_idx:
+                stats["result"] = "no_next_candle"
                 return None
 
             entry = candles[i + 1]["o"]
             sl = max(level * (1 + 0.005), sig["h"] * 1.002)
             risk = sl - entry
             if risk <= 0:
+                count("historical_retest_invalid_risk")
                 i += 1
                 continue
             tp = entry - BT_RR_TARGET * risk
@@ -639,10 +657,15 @@ def evaluate_last_candle(candles: list[dict]) -> dict | None:
                     break
 
             if exit_i is None:
+                count("historical_retest_unresolved")
+                stats["result"] = "historical_setup_unresolved"
                 return None
             if exit_i >= last_idx:
+                count("historical_retest_exited_on_latest_candle")
+                stats["result"] = "historical_setup_exited_on_latest_candle"
                 return None
 
+            count("historical_retest_not_latest")
             i = exit_i + 1
             continue
 
@@ -653,26 +676,41 @@ def evaluate_last_candle(candles: list[dict]) -> dict | None:
         avg_vol = sum(recent_vol) / len(recent_vol) if recent_vol else 0
         vol_ok = avg_vol == 0 or sig["v"] >= avg_vol
 
-        if resistance and sig["c"] > resistance * (1 + BT_BREAKOUT_MARGIN) and vol_ok:
+        long_breakout = bool(resistance and sig["c"] > resistance * (1 + BT_BREAKOUT_MARGIN))
+        short_breakout = bool(support and sig["c"] < support * (1 - BT_BREAKOUT_MARGIN))
+        if long_breakout and not vol_ok:
+            count("breakout_rejected_volume_long")
+        if short_breakout and not vol_ok:
+            count("breakout_rejected_volume_short")
+
+        if long_breakout and vol_ok:
+            count("breakout_detected_long")
             already_pending = any(
                 p["dir"] == "LONG" and p["level"] == resistance for p in pending
             )
             if not already_pending:
-                pending.append({
-                    "level": resistance, "dir": "LONG", "breakout_i": i
-                })
+                pending.append({"level": resistance, "dir": "LONG", "breakout_i": i})
 
-        if support and sig["c"] < support * (1 - BT_BREAKOUT_MARGIN) and vol_ok:
+        if short_breakout and vol_ok:
+            count("breakout_detected_short")
             already_pending = any(
                 p["dir"] == "SHORT" and p["level"] == support for p in pending
             )
             if not already_pending:
-                pending.append({
-                    "level": support, "dir": "SHORT", "breakout_i": i
-                })
+                pending.append({"level": support, "dir": "SHORT", "breakout_i": i})
 
         i += 1
 
+    if stats.get("retest_triggered"):
+        stats["result"] = "retest_seen_but_no_latest_valid_signal"
+    elif stats.get("breakout_detected_short"):
+        stats["result"] = "short_breakout_seen_but_no_valid_retest"
+    elif stats.get("breakout_rejected_volume_short"):
+        stats["result"] = "short_breakout_rejected_by_volume"
+    elif stats.get("breakout_detected_long"):
+        stats["result"] = "only_long_breakouts_detected_but_strategy_is_short_only"
+    else:
+        stats["result"] = "no_qualifying_breakout"
     return None
 
 
@@ -978,8 +1016,13 @@ async def check_live_signals() -> None:
                 )
                 continue
 
-            sig = await asyncio.to_thread(evaluate_last_candle, closed_candles)
+            diagnostics: dict = {}
+            sig = await asyncio.to_thread(evaluate_last_candle, closed_candles, diagnostics)
             if sig is None:
+                logging.info(
+                    "Live signal diagnostics: coin=%s result=%s counters=%s",
+                    coin, diagnostics.get("result", "no_signal"), diagnostics
+                )
                 continue
 
             if sig.get("direction") != "SHORT" or sig.get("regime") != "TREND_DOWN":
