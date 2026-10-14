@@ -959,7 +959,7 @@ async def outbox_worker() -> None:
             continue
 
         if task is None:
-            now = asyncio.get_running_loop().time()
+            now = time.monotonic()
             if now - last_idle_log >= 300:
                 logging.info("Outbox worker: no pending tasks")
                 last_idle_log = now
