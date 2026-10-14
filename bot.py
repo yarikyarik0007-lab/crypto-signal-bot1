@@ -20,6 +20,7 @@ from aiohttp import web
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 SIGNAL_CHANNEL_ID = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
+SIGNAL_CHANNEL_ID_TEST = os.getenv("SIGNAL_CHANNEL_ID_TEST", "").strip()
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
 STRATEGY_VERSION = "v0.5.1-experimental"
 
@@ -868,9 +869,12 @@ async def save_live_signal(sig: dict, source: str = "live") -> int:
 
 
 async def notify_channel(sig: dict) -> bool:
-    """Публикует сигнал в канал; ошибки не прерывают live-цикл."""
-    if not SIGNAL_CHANNEL_ID:
-        logging.error("notify_channel skipped: SIGNAL_CHANNEL_ID is empty")
+    """Публикует сигнал в целевой канал; тестовые сигналы не попадают в production."""
+    is_test_signal = sig.get("reason") == "TESTSIGNAL"
+    target_channel_id = SIGNAL_CHANNEL_ID_TEST if is_test_signal else SIGNAL_CHANNEL_ID
+    if not target_channel_id:
+        target_name = "SIGNAL_CHANNEL_ID_TEST" if is_test_signal else "SIGNAL_CHANNEL_ID"
+        logging.error("notify_channel skipped: %s is empty", target_name)
         return False
     try:
         coin = str(sig.get("coin", "UNKNOWN")).upper()
@@ -903,7 +907,7 @@ async def notify_channel(sig: dict) -> bool:
                 f"RR: <b>1:{rr:.2f}</b>\n"
                 f"Режим: <b>{regime}</b>"
             )
-            await bot.send_message(chat_id=SIGNAL_CHANNEL_ID, text=text)
+            await bot.send_message(chat_id=target_channel_id, text=text)
         finally:
             await bot.session.close()
         logging.info("Live signal published: coin=%s direction=%s", coin, direction)
@@ -915,6 +919,8 @@ async def notify_channel(sig: dict) -> bool:
 
 async def outbox_worker() -> None:
     """Доставляет PENDING-задачи Outbox с ограниченными повторами и backoff."""
+    logging.info("Outbox worker started: poll_interval=%ss max_attempts=%s", OUTBOX_POLL_INTERVAL_SECONDS, OUTBOX_MAX_ATTEMPTS)
+    last_idle_log = 0.0
     while True:
         if _DB_POOL is None:
             await asyncio.sleep(OUTBOX_POLL_INTERVAL_SECONDS)
@@ -953,11 +959,16 @@ async def outbox_worker() -> None:
             continue
 
         if task is None:
+            now = asyncio.get_running_loop().time()
+            if now - last_idle_log >= 300:
+                logging.info("Outbox worker: no pending tasks")
+                last_idle_log = now
             await asyncio.sleep(OUTBOX_POLL_INTERVAL_SECONDS)
             continue
 
         outbox_id = int(task["id"])
         attempts = int(task["attempts"])
+        logging.info("Outbox worker claimed task: id=%s signal_id=%s attempts=%s", outbox_id, task["signal_id"], attempts)
         error_text = None
         sent = False
 
@@ -992,7 +1003,7 @@ async def outbox_worker() -> None:
                         outbox_id,
                     )
                     logging.info(
-                        "Outbox delivery succeeded: id=%s signal_id=%s attempts=%s",
+                        "Outbox task SENT: id=%s signal_id=%s attempts=%s",
                         outbox_id, task["signal_id"], attempts,
                     )
                 else:
@@ -1016,10 +1027,17 @@ async def outbox_worker() -> None:
                         outbox_id, status, error_text or "Unknown delivery error",
                         delay_seconds,
                     )
-                    logging.info(
-                        "Outbox task rescheduled: id=%s status=%s attempts=%s delay_seconds=%s",
-                        outbox_id, status, attempts, delay_seconds,
-                    )
+                    if status == "FAILED":
+                        logging.error(
+                            "Outbox task FAILED: id=%s signal_id=%s attempts=%s last_error=%s",
+                            outbox_id, task["signal_id"], attempts,
+                            (error_text or "Unknown delivery error")[:500],
+                        )
+                    else:
+                        logging.info(
+                            "Outbox task retry scheduled: id=%s status=%s attempts=%s delay_seconds=%s",
+                            outbox_id, status, attempts, delay_seconds,
+                        )
         except Exception:
             # Если Telegram принял сообщение, а запись SENT не сохранилась,
             # задача может быть отправлена повторно после lease. Это at-least-once delivery.
@@ -1982,9 +2000,9 @@ async def cmd_testsignal(message: Message):
         }
         signal_id = await save_live_signal(sig, source="test")
         if signal_id > 0:
-            sent = await notify_channel(sig)
             await message.answer(
-                f"✅ Тестовый сигнал сохранён: id={signal_id}. В канал: {sent}"
+                f"✅ Тестовый сигнал сохранён и поставлен в outbox: id={signal_id}. "
+                "Доставка выполняется воркером в тестовый канал."
             )
         else:
             await message.answer(
