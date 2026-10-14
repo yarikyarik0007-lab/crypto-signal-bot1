@@ -1935,18 +1935,18 @@ async def cmd_test_channel(message: Message):
         await message.answer("Не удалось определить пользователя Telegram.")
         return
 
-    if not SIGNAL_CHANNEL_ID:
+    if not SIGNAL_CHANNEL_ID_TEST:
         await message.answer(
-            "❌ Не задан SIGNAL_CHANNEL_ID в Render Environment. "
-            "Добавьте ID канала и повторите тест."
+            "❌ Не задан SIGNAL_CHANNEL_ID_TEST в Render Environment. "
+            "Добавьте ID тестового канала (SIGNAL_CHANNEL_ID_TEST) и повторите тест."
         )
         return
 
     try:
-        admins = await message.bot.get_chat_administrators(chat_id=SIGNAL_CHANNEL_ID)
+        admins = await message.bot.get_chat_administrators(chat_id=SIGNAL_CHANNEL_ID_TEST)
         is_channel_admin = any(admin.user.id == message.from_user.id for admin in admins)
         if not is_channel_admin:
-            await message.answer("⛔ Тест доступен только администратору целевого канала.")
+            await message.answer("⛔ Тест доступен только администратору целевого тестового канала.")
             return
     except Exception:
         logging.exception("Could not verify channel administrators for test")
@@ -1958,7 +1958,7 @@ async def cmd_test_channel(message: Message):
 
     try:
         await message.bot.send_message(
-            chat_id=SIGNAL_CHANNEL_ID,
+            chat_id=SIGNAL_CHANNEL_ID_TEST,
             text="🧪 ТЕСТ: бот может писать в канал. Это техническая проверка, не торговый сигнал.",
         )
         await message.answer("✅ Тестовое сообщение отправлено в канал. Проверьте публикацию.")
