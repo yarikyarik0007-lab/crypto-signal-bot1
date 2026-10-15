@@ -2014,6 +2014,74 @@ async def _send_long_message(message: Message, lines: list[str], limit: int = 35
         await message.answer(chunk)
 
 
+@router.message(Command("dbsignal"))
+async def cmd_dbsignal(message: Message):
+    """Read-only lookup of one signal; administrator only."""
+    if not message.from_user or not ADMIN_USER_ID or str(message.from_user.id) != ADMIN_USER_ID:
+        await message.answer("⛔ Команда доступна только администратору.")
+        return
+
+    parts = (message.text or "").strip().split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Неверный id")
+        return
+
+    signal_id = int(parts[1])
+    if signal_id <= 0:
+        await message.answer("Неверный id")
+        return
+
+    if _DB_POOL is None:
+        await message.answer("❌ PostgreSQL не подключён.")
+        return
+
+    try:
+        async with _DB_POOL.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, coin, direction, source, status, created_at,
+                       entry_price, stop_loss AS sl_price,
+                       take_profit AS tp_price, result_r, closed_at
+                FROM signals
+                WHERE id = $1
+                """,
+                signal_id,
+            )
+
+        if row is None:
+            await message.answer(f"Запись id={signal_id} не найдена")
+            return
+
+        def display_value(value):
+            if value is None:
+                return "—"
+            if isinstance(value, datetime.datetime):
+                return value.isoformat()
+            return str(value)
+
+        fields = [
+            ("id", row["id"]),
+            ("coin", row["coin"]),
+            ("direction", row["direction"]),
+            ("source", row["source"]),
+            ("status", row["status"]),
+            ("created_at", row["created_at"]),
+            ("entry_price", row["entry_price"]),
+            ("sl_price", row["sl_price"]),
+            ("tp_price", row["tp_price"]),
+            ("result_r", row["result_r"]),
+            ("closed_at", row["closed_at"]),
+        ]
+        output = ["🔎 <b>Сигнал PostgreSQL</b>"]
+        output.extend(
+            f"<b>{label}:</b> {html.escape(display_value(value))}"
+            for label, value in fields
+        )
+        await message.answer("\n".join(output))
+    except Exception:
+        logging.exception("dbsignal failed")
+        await message.answer("❌ Ошибка чтения PostgreSQL. Подробности — в логах Render.")
+
 @router.message(Command("dbtest"))
 async def cmd_dbtest(message: Message):
     """Показывает состояние записей PostgreSQL по источникам."""
@@ -2125,6 +2193,13 @@ async def cmd_dbtest(message: Message):
                 ORDER BY coin
             """)
 
+            recent_rows = await conn.fetch("""
+                SELECT id, source, status, coin
+                FROM signals
+                ORDER BY id DESC
+                LIMIT 5
+            """)
+
         lines = [
             "🗄 <b>Проверка PostgreSQL</b>",
             f"Всего строк: <b>{summary['total_count']}</b>",
@@ -2188,6 +2263,17 @@ async def cmd_dbtest(message: Message):
                 )
         else:
             lines.append("Test-записей пока нет.")
+
+        lines.extend(["", "<b>Последние 5 записей:</b>"])
+        if recent_rows:
+            for row in recent_rows:
+                lines.append(
+                    f"id={row['id']} · source={html.escape(str(row['source'] or '—'))} · "
+                    f"status={html.escape(str(row['status'] or '—'))} · "
+                    f"coin={html.escape(str(row['coin'] or '—'))}"
+                )
+        else:
+            lines.append("Записей пока нет.")
 
         await _send_long_message(message, lines)
 
