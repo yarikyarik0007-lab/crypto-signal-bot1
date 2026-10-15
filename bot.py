@@ -2167,7 +2167,8 @@ async def cmd_dbsignal(message: Message):
             row = await conn.fetchrow(
                 """
                 SELECT id, coin, direction, source, status, created_at,
-                       entry_price, sl_price, tp_price, result_r, closed_at
+                       entry_price, stop_loss AS sl_price,
+                       take_profit AS tp_price, result_r, closed_at
                 FROM signals
                 WHERE id = $1
                 """,
