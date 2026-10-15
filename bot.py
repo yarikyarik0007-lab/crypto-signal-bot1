@@ -357,20 +357,24 @@ async def fetch_coin_data(coin: str) -> dict:
 
 
 async def fetch_historical_klines(symbol: str, interval: str = "4h", target: int = 1000) -> list[dict]:
-    """Постранично скачивает длинную историю свечей у BingX."""
-    all_candles: list[dict] = []
+    """Fetch a deduplicated, chronological candle history from BingX."""
+    if target <= 0:
+        return []
+
+    all_by_time: dict[int, dict] = {}
     end_time = None
     for _ in range(10):
-        if len(all_candles) >= target:
+        if len(all_by_time) >= target:
             break
         params = {"symbol": symbol, "interval": interval, "limit": 500}
-        if end_time:
+        if end_time is not None:
             params["endTime"] = end_time
         payload = await _get_json(f"{BINGX_BASE}/openApi/swap/v2/quote/klines", params)
         raw = payload.get("data") if payload else None
         if not raw:
             break
-        batch = []
+
+        batch_by_time: dict[int, dict] = {}
         for item in raw:
             try:
                 if isinstance(item, dict):
@@ -384,23 +388,35 @@ async def fetch_historical_klines(symbol: str, interval: str = "4h", target: int
                                       float(item[3]), float(item[4]), float(item[5]))
                 else:
                     continue
-                batch.append({"t": t, "o": o, "h": h, "l": l, "c": c, "v": v})
-            except (TypeError, ValueError):
+                prices = (o, h, l, c)
+                if (t <= 0 or not all(math.isfinite(value) and value > 0 for value in prices)
+                        or not math.isfinite(v) or v < 0
+                        or l > min(o, c) or h < max(o, c) or l > h):
+                    continue
+                batch_by_time[t] = {"t": t, "o": o, "h": h, "l": l, "c": c, "v": v}
+            except (TypeError, ValueError, OverflowError):
                 continue
+
+        if not batch_by_time:
+            break
+        batch = sorted(batch_by_time.values(), key=lambda x: x["t"])
+        existing_min_t = min(all_by_time) if all_by_time else None
+        if existing_min_t is not None:
+            batch = [candle for candle in batch if candle["t"] < existing_min_t]
         if not batch:
+            # The endpoint did not move the history window backwards; avoid looping on duplicates.
             break
-        batch.sort(key=lambda x: x["t"])
-        if all_candles:
-            existing_min_t = min(x["t"] for x in all_candles)
-            batch = [x for x in batch if x["t"] < existing_min_t]
-        if not batch:
+
+        for candle in batch:
+            all_by_time[candle["t"]] = candle
+        next_end_time = batch[0]["t"] - 1
+        if end_time is not None and next_end_time >= end_time:
+            logging.warning("BingX kline pagination did not move backwards for %s", symbol)
             break
-        all_candles = batch + all_candles
-        end_time = batch[0]["t"] - 1
-        if len(batch) < 10:
-            break
-    all_candles.sort(key=lambda x: x["t"])
-    return all_candles[-target:] if len(all_candles) > target else all_candles
+        end_time = next_end_time
+
+    candles = sorted(all_by_time.values(), key=lambda x: x["t"])
+    return candles[-target:]
 
 
 BT_ZONE_LOOKBACK = 40
@@ -1039,6 +1055,139 @@ async def outbox_worker_supervisor() -> None:
             await asyncio.sleep(10)
 
 
+def evaluate_signal_candle_outcome(signal: dict, candle: dict) -> dict | None:
+    """Evaluate one closed OHLC candle; if both levels are touched, assume SL first."""
+    try:
+        direction = str(signal.get("direction", "")).upper()
+        entry = float(signal["entry_price"])
+        sl = float(signal["stop_loss"])
+        tp = float(signal["take_profit"])
+        high = float(candle["h"])
+        low = float(candle["l"])
+        values = (entry, sl, tp, high, low)
+        if direction not in ("LONG", "SHORT") or not all(
+            math.isfinite(v) and v > 0 for v in values
+        ):
+            return None
+        # Reject malformed candle ranges and stop/target levels on the wrong side.
+        if low > high:
+            return None
+        if direction == "LONG":
+            if not sl < entry < tp:
+                return None
+        elif not tp < entry < sl:
+            return None
+
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return None
+        if direction == "SHORT":
+            hit_sl = high >= sl
+            hit_tp = low <= tp
+        else:
+            hit_sl = low <= sl
+            hit_tp = high >= tp
+        if not hit_sl and not hit_tp:
+            return None
+        # If both levels are touched within one OHLC candle, conservatively count SL first.
+        is_loss = hit_sl
+        gross_r = -1.0 if is_loss else abs(tp - entry) / risk
+        return {
+            "status": "LOSS" if is_loss else "WIN",
+            "result_r": round(gross_r - BT_FEE_R, 2),
+        }
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _first_full_candle_ms(created_at, interval_ms: int = 4 * 3600 * 1000) -> int:
+    """Не использует свечу, открывшуюся до сохранения сигнала."""
+    created_ms = int(created_at.timestamp() * 1000)
+    return ((created_ms + interval_ms - 1) // interval_ms) * interval_ms
+
+
+async def check_live_signal_outcomes() -> None:
+    """Отслеживает только live-сигналы и атомарно записывает первый подтверждённый TP/SL."""
+    if _DB_POOL is None:
+        return
+    try:
+        async with _DB_POOL.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT id, coin, direction, entry_price, stop_loss, take_profit, created_at
+                FROM signals
+                WHERE source = 'live' AND status = 'ACTIVE'
+                ORDER BY created_at, id
+            """)
+    except Exception:
+        logging.exception("Live outcome monitor could not load active signals")
+        return
+
+    if not rows:
+        return
+
+    by_coin: dict[str, list[dict]] = {}
+    for row in rows:
+        item = dict(row)
+        by_coin.setdefault(str(item["coin"]).upper(), []).append(item)
+
+    interval_ms = 4 * 3600 * 1000
+    for coin, signals in by_coin.items():
+        symbol = BINGX_SYMBOL.get(coin)
+        if not symbol:
+            logging.warning("Live outcome monitor: unsupported coin=%s", coin)
+            continue
+        try:
+            candles = await fetch_historical_klines(symbol, interval="4h", target=200)
+            if not candles:
+                logging.warning("Live outcome monitor: no candles for %s", coin)
+                continue
+            closed_candles = [
+                candle for candle in candles
+                if candle.get("t") and is_candle_closed(int(candle["t"]), interval_ms)
+            ]
+            for signal in signals:
+                first_candle_ms = _first_full_candle_ms(signal["created_at"], interval_ms)
+                levels = {
+                    "direction": signal["direction"],
+                    "entry_price": signal["entry_price"],
+                    "stop_loss": signal["stop_loss"],
+                    "take_profit": signal["take_profit"],
+                }
+                for candle in closed_candles:
+                    candle_ms = int(candle["t"])
+                    if candle_ms < first_candle_ms:
+                        continue
+                    outcome = evaluate_signal_candle_outcome(levels, candle)
+                    if outcome is None:
+                        continue
+                    closed_at_ms = candle_ms + interval_ms
+                    # Условие status='ACTIVE' защищает от двойного закрытия при гонке/перезапуске.
+                    async with _DB_POOL.acquire() as conn:
+                        async with conn.transaction():
+                            await conn.execute(
+                                "SELECT pg_advisory_xact_lock(hashtext($1))",
+                                coin,
+                            )
+                            updated_id = await conn.fetchval("""
+                                UPDATE signals
+                                SET status = $1,
+                                    result_r = $2,
+                                    closed_at = to_timestamp($3::double precision / 1000.0)
+                                WHERE id = $4
+                                  AND source = 'live'
+                                  AND status = 'ACTIVE'
+                                RETURNING id
+                            """, outcome["status"], outcome["result_r"], closed_at_ms, signal["id"])
+                    if updated_id is not None:
+                        logging.info(
+                            "LIVE SIGNAL CLOSED: id=%s coin=%s status=%s result_r=%+.2f candle_t=%s",
+                            updated_id, coin, outcome["status"], outcome["result_r"], candle_ms,
+                        )
+                    break
+        except Exception:
+            logging.exception("Live outcome monitor failed for coin=%s", coin)
+
+
 async def check_live_signals() -> None:
     """C4.1: ищет live-сигналы по всем монетам; только логирование."""
     found_count = 0
@@ -1310,6 +1459,12 @@ async def market_data_loop():
         iteration += 1
         try:
             await refresh_all_market_data()
+
+            try:
+                await check_live_signal_outcomes()
+            except Exception:
+                # Outcome monitoring must never prevent new-signal discovery.
+                logging.exception("Live outcome monitor iteration failed")
 
             now = loop.time()
             if now >= next_live_check:
@@ -1673,32 +1828,32 @@ async def get_stats(source: str) -> dict:
                 SELECT
                     COUNT(*) AS total_signals,
                     COUNT(*) FILTER (
-                        WHERE status = 'CLOSED' AND result_r IS NOT NULL
+                        WHERE status IN ('WIN', 'LOSS') AND result_r IS NOT NULL
                     ) AS closed_count,
                     COUNT(*) FILTER (
-                        WHERE status = 'CLOSED' AND result_r > 0
+                        WHERE status = 'WIN' AND result_r IS NOT NULL
                     ) AS wins,
                     COUNT(*) FILTER (
-                        WHERE status = 'CLOSED' AND result_r < 0
+                        WHERE status = 'LOSS' AND result_r IS NOT NULL
                     ) AS losses,
                     COUNT(*) FILTER (
-                        WHERE status = 'CLOSED' AND result_r = 0
+                        WHERE status IN ('WIN', 'LOSS') AND result_r = 0
                     ) AS breakeven,
                     COUNT(*) FILTER (
-                        WHERE status = 'CLOSED' AND direction = 'LONG'
+                        WHERE status IN ('WIN', 'LOSS') AND direction = 'LONG'
                     ) AS long_count,
                     COUNT(*) FILTER (
-                        WHERE status = 'CLOSED' AND direction = 'SHORT'
+                        WHERE status IN ('WIN', 'LOSS') AND direction = 'SHORT'
                     ) AS short_count,
-                    COUNT(*) FILTER (WHERE status <> 'CLOSED') AS open_count,
+                    COUNT(*) FILTER (WHERE status = 'ACTIVE') AS open_count,
                     COALESCE(SUM(result_r) FILTER (
-                        WHERE status = 'CLOSED' AND result_r IS NOT NULL
+                        WHERE status IN ('WIN', 'LOSS') AND result_r IS NOT NULL
                     ), 0) AS total_r,
                     COALESCE(SUM(result_r) FILTER (
-                        WHERE status = 'CLOSED' AND result_r > 0
+                        WHERE status = 'WIN' AND result_r IS NOT NULL
                     ), 0) AS gross_profit_r,
                     COALESCE(SUM(result_r) FILTER (
-                        WHERE status = 'CLOSED' AND result_r < 0
+                        WHERE status = 'LOSS' AND result_r IS NOT NULL
                     ), 0) AS gross_loss_r
                 FROM signals
                 WHERE source = 'live'
@@ -1706,16 +1861,16 @@ async def get_stats(source: str) -> dict:
             by_coin = await conn.fetch("""
                 SELECT coin,
                        COUNT(*) FILTER (
-                           WHERE status = 'CLOSED' AND result_r IS NOT NULL
+                           WHERE status IN ('WIN', 'LOSS') AND result_r IS NOT NULL
                        ) AS trades,
                        COALESCE(SUM(result_r) FILTER (
-                           WHERE status = 'CLOSED' AND result_r IS NOT NULL
+                           WHERE status IN ('WIN', 'LOSS') AND result_r IS NOT NULL
                        ), 0) AS total_r
                 FROM signals
                 WHERE source = 'live'
                 GROUP BY coin
                 HAVING COUNT(*) FILTER (
-                    WHERE status = 'CLOSED' AND result_r IS NOT NULL
+                    WHERE status IN ('WIN', 'LOSS') AND result_r IS NOT NULL
                 ) > 0
                 ORDER BY total_r DESC, coin
             """)
@@ -1748,7 +1903,7 @@ async def get_recent_signals(limit: int = 5, source: str = "backtest") -> list[d
                 FROM signals
                 WHERE source = 'backtest'
                   AND strategy_version = $1
-                  AND status = 'CLOSED'
+                  AND status IN ('WIN', 'LOSS')
                   AND result_r IS NOT NULL
                 ORDER BY COALESCE(closed_at, created_at) DESC, id DESC
                 LIMIT $2
@@ -1758,7 +1913,7 @@ async def get_recent_signals(limit: int = 5, source: str = "backtest") -> list[d
                 SELECT coin, direction, result_r, closed_at, created_at
                 FROM signals
                 WHERE source = 'live'
-                  AND status = 'CLOSED'
+                  AND status IN ('WIN', 'LOSS')
                   AND result_r IS NOT NULL
                 ORDER BY COALESCE(closed_at, created_at) DESC, id DESC
                 LIMIT $1
