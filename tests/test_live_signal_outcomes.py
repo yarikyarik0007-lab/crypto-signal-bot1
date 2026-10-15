@@ -87,7 +87,7 @@ class LiveSignalOutcomeTests(unittest.IsolatedAsyncioTestCase):
             evaluate_signal_candle_outcome(self.short, {"h": 97.0, "l": 102.0})
         )
 
-    def test_historical_klines_are_chronological_and_pagination_moves_backwards(self):
+    async def test_historical_klines_are_chronological_and_pagination_moves_backwards(self):
         newest = {
             "data": [
                 {"time": "400", "open": "10", "high": "12", "low": "9", "close": "11", "volume": "5"},
@@ -109,7 +109,7 @@ class LiveSignalOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.await_count, 2)
         self.assertEqual(request.await_args_list[1].args[1]["endTime"], 299)
 
-    def test_historical_klines_reject_invalid_ohlc_rows(self):
+    async def test_historical_klines_reject_invalid_ohlc_rows(self):
         payload = {
             "data": [
                 {"time": "100", "open": "10", "high": "9", "low": "8", "close": "9", "volume": "1"},
