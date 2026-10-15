@@ -357,20 +357,24 @@ async def fetch_coin_data(coin: str) -> dict:
 
 
 async def fetch_historical_klines(symbol: str, interval: str = "4h", target: int = 1000) -> list[dict]:
-    """Постранично скачивает длинную историю свечей у BingX."""
-    all_candles: list[dict] = []
+    """Fetch a deduplicated, chronological candle history from BingX."""
+    if target <= 0:
+        return []
+
+    all_by_time: dict[int, dict] = {}
     end_time = None
     for _ in range(10):
-        if len(all_candles) >= target:
+        if len(all_by_time) >= target:
             break
         params = {"symbol": symbol, "interval": interval, "limit": 500}
-        if end_time:
+        if end_time is not None:
             params["endTime"] = end_time
         payload = await _get_json(f"{BINGX_BASE}/openApi/swap/v2/quote/klines", params)
         raw = payload.get("data") if payload else None
         if not raw:
             break
-        batch = []
+
+        batch_by_time: dict[int, dict] = {}
         for item in raw:
             try:
                 if isinstance(item, dict):
@@ -384,23 +388,35 @@ async def fetch_historical_klines(symbol: str, interval: str = "4h", target: int
                                       float(item[3]), float(item[4]), float(item[5]))
                 else:
                     continue
-                batch.append({"t": t, "o": o, "h": h, "l": l, "c": c, "v": v})
-            except (TypeError, ValueError):
+                prices = (o, h, l, c)
+                if (t <= 0 or not all(math.isfinite(value) and value > 0 for value in prices)
+                        or not math.isfinite(v) or v < 0
+                        or l > min(o, c) or h < max(o, c) or l > h):
+                    continue
+                batch_by_time[t] = {"t": t, "o": o, "h": h, "l": l, "c": c, "v": v}
+            except (TypeError, ValueError, OverflowError):
                 continue
+
+        if not batch_by_time:
+            break
+        batch = sorted(batch_by_time.values(), key=lambda x: x["t"])
+        existing_min_t = min(all_by_time) if all_by_time else None
+        if existing_min_t is not None:
+            batch = [candle for candle in batch if candle["t"] < existing_min_t]
         if not batch:
+            # The endpoint did not move the history window backwards; avoid looping on duplicates.
             break
-        batch.sort(key=lambda x: x["t"])
-        if all_candles:
-            existing_min_t = min(x["t"] for x in all_candles)
-            batch = [x for x in batch if x["t"] < existing_min_t]
-        if not batch:
+
+        for candle in batch:
+            all_by_time[candle["t"]] = candle
+        next_end_time = batch[0]["t"] - 1
+        if end_time is not None and next_end_time >= end_time:
+            logging.warning("BingX kline pagination did not move backwards for %s", symbol)
             break
-        all_candles = batch + all_candles
-        end_time = batch[0]["t"] - 1
-        if len(batch) < 10:
-            break
-    all_candles.sort(key=lambda x: x["t"])
-    return all_candles[-target:] if len(all_candles) > target else all_candles
+        end_time = next_end_time
+
+    candles = sorted(all_by_time.values(), key=lambda x: x["t"])
+    return candles[-target:]
 
 
 BT_ZONE_LOOKBACK = 40
@@ -1041,7 +1057,7 @@ async def outbox_worker_supervisor() -> None:
 
 
 def evaluate_signal_candle_outcome(signal: dict, candle: dict) -> dict | None:
-    """Возвращает итог по одной закрытой свече; при одновременном SL/TP приоритет у SL."""
+    """Evaluate one closed OHLC candle; if both levels are touched, assume SL first."""
     try:
         direction = str(signal.get("direction", "")).upper()
         entry = float(signal["entry_price"])
@@ -1054,6 +1070,15 @@ def evaluate_signal_candle_outcome(signal: dict, candle: dict) -> dict | None:
             math.isfinite(v) and v > 0 for v in values
         ):
             return None
+        # Reject malformed candle ranges and stop/target levels on the wrong side.
+        if low > high:
+            return None
+        if direction == "LONG":
+            if not sl < entry < tp:
+                return None
+        elif not tp < entry < sl:
+            return None
+
         risk = abs(entry - sl)
         if risk <= 0:
             return None
@@ -1065,7 +1090,7 @@ def evaluate_signal_candle_outcome(signal: dict, candle: dict) -> dict | None:
             hit_tp = high >= tp
         if not hit_sl and not hit_tp:
             return None
-        # Если внутри одной OHLC-свечи затронуты оба уровня, считаем SL первым.
+        # If both levels are touched within one OHLC candle, conservatively count SL first.
         is_loss = hit_sl
         gross_r = -1.0 if is_loss else abs(tp - entry) / risk
         return {
