@@ -10,7 +10,7 @@ from bot import (
 )
 
 
-class LiveSignalOutcomeTests(unittest.TestCase):
+class LiveSignalOutcomeTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.short = {
             "direction": "SHORT",
