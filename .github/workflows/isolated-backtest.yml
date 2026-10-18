@@ -1,0 +1,37 @@
+name: Isolated strategy backtest research
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - analysis/backtest-variants-2026-10
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out isolated research branch
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install bot dependencies
+        run: pip install -r requirements.txt
+      - name: Compile research harness
+        run: python -m py_compile bot.py research/backtest_variants.py
+      - name: Run A-D backtests on closed 4h candles
+        run: python research/backtest_variants.py
+        env:
+          BT_CANDLES: '1200'
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strategy-backtest-results
+          path: backtest-results/
+          if-no-files-found: warn
