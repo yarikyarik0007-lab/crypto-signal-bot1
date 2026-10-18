@@ -23,7 +23,7 @@ jobs:
       - name: Install bot dependencies
         run: pip install -r requirements.txt
       - name: Compile research harness
-        run: python -m py_compile bot.py research/backtest_variants.py research/walkforward_coin_filter.py research/cost_stress_test.py
+        run: python -m py_compile bot.py research/backtest_variants.py research/walkforward_coin_filter.py research/cost_stress_test.py research/expand_universe_test.py
       - name: Run A-D backtests on closed 4h candles
         run: python research/backtest_variants.py
         env:
@@ -34,6 +34,10 @@ jobs:
           BT_CANDLES: '4000'
       - name: Run transaction-cost sensitivity (assumption-based)
         run: python research/cost_stress_test.py
+        env:
+          BT_CANDLES: '4000'
+      - name: Validate additional symbols without changing production universe
+        run: python research/expand_universe_test.py
         env:
           BT_CANDLES: '4000'
       - name: Upload metrics
