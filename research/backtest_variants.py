@@ -5,8 +5,10 @@ import json
 import math
 import os
 import statistics
+import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import aiohttp
 import bot
 
@@ -82,7 +84,7 @@ def run_variant(candles, *, pivot="extreme", volume_multiple=1.0,
                 exit_i = n - 1
             exit_r -= bot.BT_FEE_R
             trades.append({"dir": direction, "entry_i": i + 1, "exit_i": exit_i,
-                           "r": round(exit_r, 4), "regime": regime,
+                           "r": round(exit_r, 2), "regime": regime,
                            "entry_time": candles[i + 1].get("t"),
                            "exit_time": candles[exit_i].get("t")})
             pending = []
