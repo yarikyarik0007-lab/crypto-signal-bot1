@@ -94,7 +94,7 @@ def run_variant(candles, *, pivot="extreme", volume_multiple=1.0,
             exit_r -= bot.BT_FEE_R
             entry_i = i if entry_at_close else i + 1
             trades.append({"dir": direction, "entry_i": entry_i, "exit_i": exit_i,
-                           "r": round(exit_r, 4), "gross_r": round(gross_r, 6),
+                           "r": round(exit_r, 2), "gross_r": round(gross_r, 6),
                            "entry_price": entry, "exit_price": exit_price, "risk_price": risk,
                            "exit_reason": exit_reason, "regime": regime,
                            "entry_time": candles[entry_i].get("t"),
