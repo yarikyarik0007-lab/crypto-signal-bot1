@@ -12,7 +12,7 @@ permissions:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - name: Check out isolated research branch
         uses: actions/checkout@v4
@@ -27,7 +27,7 @@ jobs:
       - name: Run A-D backtests on closed 4h candles
         run: python research/backtest_variants.py
         env:
-          BT_CANDLES: '1200'
+          BT_CANDLES: '4000'
       - name: Upload metrics
         if: always()
         uses: actions/upload-artifact@v4
