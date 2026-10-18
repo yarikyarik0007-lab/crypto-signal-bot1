@@ -76,22 +76,27 @@ def run_variant(candles, *, pivot="extreme", volume_multiple=1.0,
                 i += 1
                 continue
             tp = entry - bot.BT_RR_TARGET * risk
-            exit_r, exit_i = None, None
+            exit_r, exit_i, exit_price, exit_reason = None, None, None, None
             for k in range(i + 1, n):
                 c = candles[k]
                 if c["h"] >= sl:
-                    exit_r, exit_i = -1.0, k
+                    exit_r, exit_i, exit_price, exit_reason = -1.0, k, sl, "stop"
                     break
                 if c["l"] <= tp:
-                    exit_r, exit_i = bot.BT_RR_TARGET, k
+                    exit_r, exit_i, exit_price, exit_reason = bot.BT_RR_TARGET, k, tp, "target"
                     break
             if exit_r is None:
-                exit_r = (candles[-1]["c"] - entry) / risk
                 exit_i = n - 1
+                exit_price = candles[-1]["c"]
+                exit_r = (exit_price - entry) / risk
+                exit_reason = "data_end"
+            gross_r = exit_r
             exit_r -= bot.BT_FEE_R
             entry_i = i if entry_at_close else i + 1
             trades.append({"dir": direction, "entry_i": entry_i, "exit_i": exit_i,
-                           "r": round(exit_r, 2), "regime": regime,
+                           "r": round(exit_r, 4), "gross_r": round(gross_r, 6),
+                           "entry_price": entry, "exit_price": exit_price, "risk_price": risk,
+                           "exit_reason": exit_reason, "regime": regime,
                            "entry_time": candles[entry_i].get("t"),
                            "exit_time": candles[exit_i].get("t")})
             pending = []
