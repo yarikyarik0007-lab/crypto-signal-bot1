@@ -23,9 +23,13 @@ jobs:
       - name: Install bot dependencies
         run: pip install -r requirements.txt
       - name: Compile research harness
-        run: python -m py_compile bot.py research/backtest_variants.py
+        run: python -m py_compile bot.py research/backtest_variants.py research/walkforward_coin_filter.py
       - name: Run A-D backtests on closed 4h candles
         run: python research/backtest_variants.py
+        env:
+          BT_CANDLES: '4000'
+      - name: Run walk-forward coin filter validation
+        run: python research/walkforward_coin_filter.py
         env:
           BT_CANDLES: '4000'
       - name: Upload metrics
