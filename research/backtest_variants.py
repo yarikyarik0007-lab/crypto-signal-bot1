@@ -117,7 +117,10 @@ def metrics(trades):
         max_dd = max(max_dd, peak - equity)
     return {
         "trades": len(rs),
+        "wins": wins,
         "win_rate_pct": round(100 * wins / len(rs), 2) if rs else 0.0,
+        "gross_win_R": round(gross_win, 3),
+        "gross_loss_R": round(gross_loss, 3),
         "profit_factor": round(gross_win / gross_loss, 3) if gross_loss else (999.0 if gross_win else 0.0),
         "net_R": round(sum(rs), 3),
         "max_drawdown_R": round(max_dd, 3),
@@ -187,8 +190,8 @@ async def main():
             except Exception as exc:
                 fetch_errors.append({"coin": coin, "error": repr(exc)})
                 print(f"{coin}: ERROR {exc!r}")
-    fields = ["coin", "variant", "period", "candles", "trades", "win_rate_pct",
-              "profit_factor", "net_R", "max_drawdown_R", "avg_R"]
+    fields = ["coin", "variant", "period", "candles", "trades", "wins", "win_rate_pct",
+              "gross_win_R", "gross_loss_R", "profit_factor", "net_R", "max_drawdown_R", "avg_R"]
     with (OUT / "metrics.csv").open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -201,11 +204,13 @@ async def main():
             total_trades = sum(r["trades"] for r in rows)
             total_r = sum(r["net_R"] for r in rows)
             total_dd = sum(r["max_drawdown_R"] for r in rows)
-            wins_equiv = sum(r["trades"] * r["win_rate_pct"] / 100 for r in rows)
-            gross_win = sum(max(0, r["net_R"]) for r in rows)
+            wins_total = sum(r["wins"] for r in rows)
+            gross_win = sum(r["gross_win_R"] for r in rows)
+            gross_loss = sum(r["gross_loss_R"] for r in rows)
             summaries.append({"variant": variant, "period": period, "coins_tested": len(rows),
                               "trades": total_trades,
-                              "weighted_win_rate_pct": round(100*wins_equiv/total_trades, 2) if total_trades else 0,
+                              "weighted_win_rate_pct": round(100*wins_total/total_trades, 2) if total_trades else 0,
+                              "profit_factor": round(gross_win/gross_loss, 3) if gross_loss else (999.0 if gross_win else 0.0),
                               "sum_net_R": round(total_r, 3),
                               "sum_coin_max_drawdowns_R": round(total_dd, 3)})
     (OUT / "summary.json").write_text(json.dumps({"summary": summaries, "errors": fetch_errors}, indent=2))
