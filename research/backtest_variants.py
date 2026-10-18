@@ -37,7 +37,8 @@ def nearest_pivot(candles, end_idx, lookback, side, pivot_window=bot.BT_PIVOT_WI
 
 def run_variant(candles, *, pivot="extreme", volume_multiple=1.0,
                 retest_tolerance=bot.BT_RETEST_TOLERANCE,
-                retest_window=bot.BT_RETEST_WINDOW):
+                retest_window=bot.BT_RETEST_WINDOW,
+                regime_history=None, entry_at_close=False):
     """Mirror current run_backtest; expose one controlled parameter at a time."""
     n, trades, pending = len(candles), [], []
     i = bot.BT_ZONE_LOOKBACK + bot.BT_PIVOT_WINDOW + 2
@@ -59,11 +60,16 @@ def run_variant(candles, *, pivot="extreme", volume_multiple=1.0,
         if triggered:
             pending = [p for p in pending if p is not triggered]
             direction, level = triggered["dir"], triggered["level"]
-            regime = bot.classify_regime(candles, i)
+            if regime_history is None:
+                regime = bot.classify_regime(candles, i)
+            else:
+                regime_start = max(0, i - regime_history + 1)
+                regime_candles = candles[regime_start:i + 1]
+                regime = bot.classify_regime(regime_candles, len(regime_candles) - 1)
             if regime != "TREND_DOWN" or direction != "SHORT":
                 i += 1
                 continue
-            entry = candles[i + 1]["o"]
+            entry = sig["c"] if entry_at_close else candles[i + 1]["o"]
             sl = max(level * (1 + 0.005), sig["h"] * 1.002)
             risk = sl - entry
             if risk <= 0:
@@ -83,9 +89,10 @@ def run_variant(candles, *, pivot="extreme", volume_multiple=1.0,
                 exit_r = (candles[-1]["c"] - entry) / risk
                 exit_i = n - 1
             exit_r -= bot.BT_FEE_R
-            trades.append({"dir": direction, "entry_i": i + 1, "exit_i": exit_i,
+            entry_i = i if entry_at_close else i + 1
+            trades.append({"dir": direction, "entry_i": entry_i, "exit_i": exit_i,
                            "r": round(exit_r, 2), "regime": regime,
-                           "entry_time": candles[i + 1].get("t"),
+                           "entry_time": candles[entry_i].get("t"),
                            "exit_time": candles[exit_i].get("t")})
             pending = []
             i = exit_i + 1
@@ -163,6 +170,10 @@ async def main():
                                                  retest_window=bot.BT_RETEST_WINDOW)),
                     ("D_retest_wider", dict(pivot="extreme", volume_multiple=1.0,
                                             retest_tolerance=0.01, retest_window=12)),
+                    ("E_live_like_200_close", dict(pivot="extreme", volume_multiple=1.0,
+                                                   retest_tolerance=bot.BT_RETEST_TOLERANCE,
+                                                   retest_window=bot.BT_RETEST_WINDOW,
+                                                   regime_history=200, entry_at_close=True)),
                 ]
                 train = candles[:split]
                 # Include a 200-candle warm-up, but only count entries after the split.
