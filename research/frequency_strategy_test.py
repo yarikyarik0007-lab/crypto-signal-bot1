@@ -272,6 +272,7 @@ async def main():
     errors, results, all_rows = [], [], []
     regimes_cache = {}
     htf_cache = {}
+    trades_cache = {}
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         cache = {}
         for cfg in CONFIGS:
@@ -317,6 +318,8 @@ async def main():
                     test_all = run(candles[test_start:], cfg, regimes[test_start:],
                                    htf_regimes[test_start:] if htf_regimes is not None else None)
                     test_trades = [t for t in test_all if (t.get("entry_time") or 0) >= split_time]
+                    trades_cache[(cfg["name"], coin, "train")] = train_trades
+                    trades_cache[(cfg["name"], coin, "holdout")] = test_trades
                     train_days = max(1, (candles[split - 1]["t"] - candles[0]["t"]) / 86400000)
                     test_days = max(1, (candles[-1]["t"] - split_time) / 86400000)
                     for period, trades, days in (
@@ -339,24 +342,7 @@ async def main():
             gw = sum(max(0, r["net_R"]) for r in [])  # gross values computed from trade rows below
             trades = []
             for coin in COINS:
-                candles = cache.get((coin, cfg["interval"]), [])
-                if not candles:
-                    continue
-                split = int(len(candles) * TRAIN_FRACTION)
-                split_time = candles[split]["t"]
-                regime_key = (coin, cfg["interval"])
-                if regime_key not in regimes_cache:
-                    regimes_cache[regime_key] = [bot.classify_regime(candles, idx) for idx in range(len(candles))]
-                regimes = regimes_cache[regime_key]
-                htf_regimes = htf_cache.get(regime_key)
-                if period == "train":
-                    trades.extend(run(candles[:split], cfg, regimes[:split],
-                                      htf_regimes[:split] if htf_regimes is not None else None))
-                else:
-                    test_start = max(0, split - 200)
-                    trades.extend(t for t in run(candles[test_start:], cfg, regimes[test_start:],
-                                                  htf_regimes[test_start:] if htf_regimes is not None else None)
-                                  if (t.get("entry_time") or 0) >= split_time)
+                trades.extend(trades_cache.get((cfg["name"], coin, period), []))
             trade_rs = [float(t["r"]) for t in trades]
             days = sum((max(1, (cache[(coin, cfg["interval"])][int(len(cache[(coin, cfg["interval"])])*TRAIN_FRACTION)-1]["t"] -
                                 cache[(coin, cfg["interval"])][0]["t"]) / 86400000)
