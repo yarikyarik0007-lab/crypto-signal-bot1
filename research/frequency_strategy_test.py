@@ -44,10 +44,18 @@ CONFIGS = [
      "tol": 0.010, "window": 16, "mode": "trend_both"},
     {"name": "E_1h_volume_filter_removed", "interval": "1h", "margin": 0.003, "volume": 0.0,
      "tol": 0.008, "window": 12, "mode": "trend_both"},
+    {"name": "F_2h_long_confirmed_by_4h", "interval": "2h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "long_htf", "htf": "4h"},
+    {"name": "F2_1h_long_confirmed_by_4h", "interval": "1h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "long_htf", "htf": "4h"},
+    {"name": "F3_2h_long_confirmed_by_4h_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_htf", "htf": "4h"},
+    {"name": "F4_2h_long_confirmed_by_4h_balanced", "interval": "2h", "margin": 0.003, "volume": 0.8,
+     "tol": 0.008, "window": 12, "mode": "long_htf", "htf": "4h"},
 ]
 
 
-def run(candles, cfg, regimes=None):
+def run(candles, cfg, regimes=None, htf_regimes=None):
     trades, pending = [], []
     start = bot.BT_ZONE_LOOKBACK + bot.BT_PIVOT_WINDOW + 2
     i = start
@@ -56,12 +64,15 @@ def run(candles, cfg, regimes=None):
         pending = [p for p in pending if i - p["breakout_i"] <= cfg["window"]]
         triggered = None
         regime = regimes[i] if regimes is not None else bot.classify_regime(candles, i)
+        htf_regime = htf_regimes[i] if htf_regimes is not None else None
         for p in pending:
             # Filter direction/regime before selecting a retest. Otherwise an
             # ineligible pending setup can mask an eligible setup on the same candle.
             if cfg["mode"] == "short" and (p["dir"] != "SHORT" or regime != "TREND_DOWN"):
                 continue
             if cfg["mode"] == "long" and (p["dir"] != "LONG" or regime != "TREND_UP"):
+                continue
+            if cfg["mode"] == "long_htf" and (p["dir"] != "LONG" or htf_regime != "TREND_UP"):
                 continue
             if cfg["mode"] == "trend_both":
                 if (p["dir"] == "LONG" and regime != "TREND_UP") or (
@@ -260,6 +271,7 @@ def validated_fast_regimes(candles):
 async def main():
     errors, results, all_rows = [], [], []
     regimes_cache = {}
+    htf_cache = {}
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         cache = {}
         for cfg in CONFIGS:
@@ -280,9 +292,30 @@ async def main():
                     if regime_key not in regimes_cache:
                         regimes_cache[regime_key] = validated_fast_regimes(candles)
                     regimes = regimes_cache[regime_key]
-                    train_trades = run(candles[:split], cfg, regimes[:split])
+                    htf_regimes = None
+                    if cfg.get("htf"):
+                        htf_key = (coin, cfg["htf"])
+                        if htf_key not in cache:
+                            cache[htf_key] = await load(session, coin, cfg["htf"])
+                        high_candles = cache[htf_key]
+                        if htf_key not in regimes_cache:
+                            regimes_cache[htf_key] = validated_fast_regimes(high_candles)
+                        high_regimes = regimes_cache[htf_key]
+                        import bisect
+                        high_times = [c["t"] for c in high_candles]
+                        lower_ms = {"1h": 3600000, "2h": 7200000, "4h": 14400000}[interval]
+                        high_ms = {"1h": 3600000, "2h": 7200000, "4h": 14400000}[cfg["htf"]]
+                        htf_regimes = []
+                        for candle in candles:
+                            cutoff = candle["t"] + lower_ms - high_ms
+                            hi = bisect.bisect_right(high_times, cutoff) - 1
+                            htf_regimes.append(high_regimes[hi] if hi >= 0 else "UNKNOWN")
+                        htf_cache[regime_key] = htf_regimes
+                    train_trades = run(candles[:split], cfg, regimes[:split],
+                                       htf_regimes[:split] if htf_regimes is not None else None)
                     test_start = max(0, split - 200)
-                    test_all = run(candles[test_start:], cfg, regimes[test_start:])
+                    test_all = run(candles[test_start:], cfg, regimes[test_start:],
+                                   htf_regimes[test_start:] if htf_regimes is not None else None)
                     test_trades = [t for t in test_all if (t.get("entry_time") or 0) >= split_time]
                     train_days = max(1, (candles[split - 1]["t"] - candles[0]["t"]) / 86400000)
                     test_days = max(1, (candles[-1]["t"] - split_time) / 86400000)
@@ -314,11 +347,14 @@ async def main():
                 if regime_key not in regimes_cache:
                     regimes_cache[regime_key] = [bot.classify_regime(candles, idx) for idx in range(len(candles))]
                 regimes = regimes_cache[regime_key]
+                htf_regimes = htf_cache.get(regime_key)
                 if period == "train":
-                    trades.extend(run(candles[:split], cfg, regimes[:split]))
+                    trades.extend(run(candles[:split], cfg, regimes[:split],
+                                      htf_regimes[:split] if htf_regimes is not None else None))
                 else:
                     test_start = max(0, split - 200)
-                    trades.extend(t for t in run(candles[test_start:], cfg, regimes[test_start:])
+                    trades.extend(t for t in run(candles[test_start:], cfg, regimes[test_start:],
+                                                  htf_regimes[test_start:] if htf_regimes is not None else None)
                                   if (t.get("entry_time") or 0) >= split_time)
             trade_rs = [float(t["r"]) for t in trades]
             days = sum((max(1, (cache[(coin, cfg["interval"])][int(len(cache[(coin, cfg["interval"])])*TRAIN_FRACTION)-1]["t"] -
