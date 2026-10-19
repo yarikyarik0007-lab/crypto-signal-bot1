@@ -55,7 +55,19 @@ def run(candles, cfg):
         sig = candles[i]
         pending = [p for p in pending if i - p["breakout_i"] <= cfg["window"]]
         triggered = None
+        regime = bot.classify_regime(candles, i)
         for p in pending:
+            # Filter direction/regime before selecting a retest. Otherwise an
+            # ineligible pending setup can mask an eligible setup on the same candle.
+            if cfg["mode"] == "short" and (p["dir"] != "SHORT" or regime != "TREND_DOWN"):
+                continue
+            if cfg["mode"] == "long" and (p["dir"] != "LONG" or regime != "TREND_UP"):
+                continue
+            if cfg["mode"] == "trend_both":
+                if (p["dir"] == "LONG" and regime != "TREND_UP") or (
+                    p["dir"] == "SHORT" and regime != "TREND_DOWN"
+                ):
+                    continue
             if p["dir"] == "LONG":
                 touch = sig["l"] <= p["level"] * (1 + cfg["tol"])
                 valid = touch and sig["c"] > p["level"] and sig["c"] > sig["o"]
@@ -69,19 +81,6 @@ def run(candles, cfg):
         if triggered:
             pending = [p for p in pending if p is not triggered]
             direction, level = triggered["dir"], triggered["level"]
-            regime = bot.classify_regime(candles, i)
-            if cfg["mode"] == "short" and (direction != "SHORT" or regime != "TREND_DOWN"):
-                i += 1
-                continue
-            if cfg["mode"] == "long" and (direction != "LONG" or regime != "TREND_UP"):
-                i += 1
-                continue
-            if cfg["mode"] == "trend_both":
-                if (direction == "LONG" and regime != "TREND_UP") or (
-                    direction == "SHORT" and regime != "TREND_DOWN"
-                ):
-                    i += 1
-                    continue
 
             entry = candles[i + 1]["o"]
             if direction == "LONG":
