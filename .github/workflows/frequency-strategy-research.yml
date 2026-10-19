@@ -1,0 +1,37 @@
+name: Isolated 1h strategy frequency research
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/frequency-strategy-1h-2026-10
+
+permissions:
+  contents: read
+
+jobs:
+  frequency-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout isolated research branch
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile research harness
+        run: python -m py_compile bot.py research/frequency_strategy_test.py
+      - name: Run 4h baseline and 1h candidate comparisons
+        run: python research/frequency_strategy_test.py
+        env:
+          BT_CANDLES: '4000'
+      - name: Upload frequency results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frequency-strategy-results
+          path: frequency-results/
+          if-no-files-found: warn
