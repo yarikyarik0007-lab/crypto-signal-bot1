@@ -2,13 +2,18 @@ name: Isolated 1h strategy frequency research
 
 on:
   workflow_dispatch:
-  pull_request:
   push:
     branches:
       - research/frequency-strategy-1h-2026-10
 
 permissions:
   contents: read
+
+# PR and push events previously launched duplicate 45-minute research jobs.
+# Keep only one active run for this branch and cancel stale runs on new commits.
+concurrency:
+  group: frequency-strategy-research-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   frequency-test:
