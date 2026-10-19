@@ -47,7 +47,7 @@ CONFIGS = [
 ]
 
 
-def run(candles, cfg):
+def run(candles, cfg, regimes=None):
     trades, pending = [], []
     start = bot.BT_ZONE_LOOKBACK + bot.BT_PIVOT_WINDOW + 2
     i = start
@@ -55,7 +55,7 @@ def run(candles, cfg):
         sig = candles[i]
         pending = [p for p in pending if i - p["breakout_i"] <= cfg["window"]]
         triggered = None
-        regime = bot.classify_regime(candles, i)
+        regime = regimes[i] if regimes is not None else bot.classify_regime(candles, i)
         for p in pending:
             # Filter direction/regime before selecting a retest. Otherwise an
             # ineligible pending setup can mask an eligible setup on the same candle.
@@ -167,6 +167,7 @@ async def load(session, coin, interval):
 
 async def main():
     errors, results, all_rows = [], [], []
+    regimes_cache = {}
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         cache = {}
         for cfg in CONFIGS:
@@ -183,8 +184,13 @@ async def main():
                         continue
                     split = int(len(candles) * TRAIN_FRACTION)
                     split_time = candles[split]["t"]
-                    train_trades = run(candles[:split], cfg)
-                    test_all = run(candles[max(0, split - 200):], cfg)
+                    regime_key = (coin, interval)
+                    if regime_key not in regimes_cache:
+                        regimes_cache[regime_key] = [bot.classify_regime(candles, idx) for idx in range(len(candles))]
+                    regimes = regimes_cache[regime_key]
+                    train_trades = run(candles[:split], cfg, regimes[:split])
+                    test_start = max(0, split - 200)
+                    test_all = run(candles[test_start:], cfg, regimes[test_start:])
                     test_trades = [t for t in test_all if (t.get("entry_time") or 0) >= split_time]
                     train_days = max(1, (candles[split - 1]["t"] - candles[0]["t"]) / 86400000)
                     test_days = max(1, (candles[-1]["t"] - split_time) / 86400000)
@@ -212,10 +218,15 @@ async def main():
                     continue
                 split = int(len(candles) * TRAIN_FRACTION)
                 split_time = candles[split]["t"]
+                regime_key = (coin, cfg["interval"])
+                if regime_key not in regimes_cache:
+                    regimes_cache[regime_key] = [bot.classify_regime(candles, idx) for idx in range(len(candles))]
+                regimes = regimes_cache[regime_key]
                 if period == "train":
-                    trades.extend(run(candles[:split], cfg))
+                    trades.extend(run(candles[:split], cfg, regimes[:split]))
                 else:
-                    trades.extend(t for t in run(candles[max(0, split - 200):], cfg)
+                    test_start = max(0, split - 200)
+                    trades.extend(t for t in run(candles[test_start:], cfg, regimes[test_start:])
                                   if (t.get("entry_time") or 0) >= split_time)
             trade_rs = [float(t["r"]) for t in trades]
             days = sum((max(1, (cache[(coin, cfg["interval"])][int(len(cache[(coin, cfg["interval"])])*TRAIN_FRACTION)-1]["t"] -
