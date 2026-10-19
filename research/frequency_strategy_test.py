@@ -22,6 +22,12 @@ CONFIGS = [
      "tol": 0.006, "window": 8, "mode": "short"},
     {"name": "B_1h_current_short_only", "interval": "1h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "short"},
+    {"name": "B2_2h_current_short_only", "interval": "2h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short"},
+    {"name": "C2_2h_balanced_both_directions", "interval": "2h", "margin": 0.003, "volume": 0.8,
+     "tol": 0.008, "window": 12, "mode": "trend_both"},
+    {"name": "D2_2h_stricter_both_directions", "interval": "2h", "margin": 0.004, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "trend_both"},
     {"name": "C_1h_balanced_both_directions", "interval": "1h", "margin": 0.003, "volume": 0.8,
      "tol": 0.008, "window": 12, "mode": "trend_both"},
     {"name": "D_1h_more_opportunities", "interval": "1h", "margin": 0.0025, "volume": 0.8,
@@ -142,7 +148,7 @@ def metrics(trades, days):
 async def load(session, coin, interval):
     bot._SESSION = session
     candles = await bot.fetch_historical_klines(f"{coin}-USDT", interval, TARGET)
-    interval_ms = 60 * 60 * 1000 if interval == "1h" else 4 * 60 * 60 * 1000
+    interval_ms = {"1h": 60, "2h": 120, "4h": 240}[interval] * 60 * 1000
     now_ms = int(__import__("time").time() * 1000)
     return [c for c in candles if c.get("t") and now_ms - c["t"] >= interval_ms]
 
