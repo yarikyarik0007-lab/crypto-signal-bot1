@@ -20,10 +20,20 @@ OUT.mkdir(exist_ok=True)
 CONFIGS = [
     {"name": "A_4h_current_short_only", "interval": "4h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "short"},
+    {"name": "A2_4h_long_only", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "long"},
+    {"name": "A3_4h_both_trend_aligned", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "trend_both"},
+    {"name": "A4_4h_both_moderate", "interval": "4h", "margin": 0.003, "volume": 0.8,
+     "tol": 0.008, "window": 12, "mode": "trend_both"},
     {"name": "B_1h_current_short_only", "interval": "1h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "short"},
+    {"name": "B1_1h_long_only", "interval": "1h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "long"},
     {"name": "B2_2h_current_short_only", "interval": "2h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "short"},
+    {"name": "B3_2h_long_only", "interval": "2h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "long"},
     {"name": "C2_2h_balanced_both_directions", "interval": "2h", "margin": 0.003, "volume": 0.8,
      "tol": 0.008, "window": 12, "mode": "trend_both"},
     {"name": "D2_2h_stricter_both_directions", "interval": "2h", "margin": 0.004, "volume": 1.0,
@@ -61,6 +71,9 @@ def run(candles, cfg):
             direction, level = triggered["dir"], triggered["level"]
             regime = bot.classify_regime(candles, i)
             if cfg["mode"] == "short" and (direction != "SHORT" or regime != "TREND_DOWN"):
+                i += 1
+                continue
+            if cfg["mode"] == "long" and (direction != "LONG" or regime != "TREND_UP"):
                 i += 1
                 continue
             if cfg["mode"] == "trend_both":
