@@ -148,8 +148,8 @@ def run(candles, cfg, regimes=None, htf_regimes=None):
     return trades
 
 
-def metrics(trades, days):
-    rs = [float(t["r"]) for t in trades]
+def metrics(trades, days, extra_cost_r=0.0):
+    rs = [float(t["r"]) - extra_cost_r for t in trades]
     wins = sum(x > 0 for x in rs)
     gw = sum(x for x in rs if x > 0)
     gl = -sum(x for x in rs if x < 0)
@@ -330,6 +330,7 @@ async def main():
                     errors.append({"coin": coin, "interval": interval, "error": repr(exc)})
 
     summaries = []
+    cost_stress = []
     for cfg in CONFIGS:
         for period in ("train", "holdout"):
             rows = [r for r in all_rows if r["config"] == cfg["name"] and r["period"] == period]
@@ -367,6 +368,12 @@ async def main():
             summary = {"config": cfg["name"], "period": period,
                        **metrics(trades, days)}
             summaries.append(summary)
+            for extra_cost_r in (0.05, 0.10):
+                cost_stress.append({
+                    "config": cfg["name"], "period": period,
+                    "extra_cost_R_per_trade": extra_cost_r,
+                    **metrics(trades, days, extra_cost_r=extra_cost_r),
+                })
 
     with (OUT / "per_coin.csv").open("w", newline="") as f:
         fields = list(all_rows[0].keys()) if all_rows else ["config", "coin", "period"]
@@ -374,7 +381,8 @@ async def main():
         writer.writeheader()
         writer.writerows(all_rows)
     report = {"purpose": "Compare signal frequency and trade quality on closed candles; research only.",
-              "configs": CONFIGS, "summary": summaries, "per_coin": all_rows, "errors": errors,
+              "configs": CONFIGS, "summary": summaries, "cost_stress": cost_stress,
+              "per_coin": all_rows, "errors": errors,
               "warning": "A single historical split is exploratory. Signals/day is an average across the tested coin-universe, not a promise. No production settings were changed."}
     (OUT / "summary.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({"summary": summaries, "errors": errors}, indent=2))
