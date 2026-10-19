@@ -361,6 +361,59 @@ async def main():
                     **metrics(trades, days, extra_cost_r=extra_cost_r),
                 })
 
+    # Rolling-origin validation on three later, non-overlapping entry windows.
+    # Each fold uses only candles available at/after its entry window, while retaining
+    # a warm-up history for pivots/regime labels. This is exploratory, not a guarantee.
+    walk_forward = []
+    shortlist = {
+        "A_4h_current_short_only",
+        "F_2h_long_confirmed_by_4h",
+        "F3_2h_long_confirmed_by_4h_strict",
+    }
+    folds = [(0.50, 0.65), (0.65, 0.80), (0.80, 1.00)]
+    for cfg in CONFIGS:
+        if cfg["name"] not in shortlist:
+            continue
+        for fold_no, (start_frac, end_frac) in enumerate(folds, start=1):
+            fold_trades = []
+            fold_days = []
+            fold_coin_rows = []
+            for coin in COINS:
+                candles = cache.get((coin, cfg["interval"]), [])
+                if len(candles) < 500:
+                    continue
+                start_idx = int(len(candles) * start_frac)
+                end_idx = min(len(candles), int(len(candles) * end_frac))
+                if end_idx <= start_idx + 30:
+                    continue
+                context_start = max(0, start_idx - 200)
+                regime_key = (coin, cfg["interval"])
+                regimes = regimes_cache[regime_key]
+                htf_regimes = htf_cache.get(regime_key)
+                segment = candles[context_start:]
+                segment_regimes = regimes[context_start:]
+                segment_htf = htf_regimes[context_start:] if htf_regimes is not None else None
+                candidate_trades = run(segment, cfg, segment_regimes, segment_htf)
+                start_time = candles[start_idx]["t"]
+                end_time = candles[end_idx]["t"] if end_idx < len(candles) else candles[-1]["t"] + 1
+                selected = [t for t in candidate_trades
+                            if start_time <= (t.get("entry_time") or 0) < end_time]
+                fold_trades.extend(selected)
+                days = max(1, (end_time - start_time) / 86400000)
+                fold_days.append(days)
+                fold_coin_rows.append({
+                    "config": cfg["name"], "fold": fold_no, "coin": coin,
+                    "start_fraction": start_frac, "end_fraction": end_frac,
+                    **metrics(selected, days),
+                })
+            avg_days = sum(fold_days) / len(fold_days) if fold_days else 1
+            walk_forward.append({
+                "config": cfg["name"], "fold": fold_no,
+                "start_fraction": start_frac, "end_fraction": end_frac,
+                **metrics(fold_trades, avg_days),
+            })
+            walk_forward.extend(fold_coin_rows)
+
     with (OUT / "per_coin.csv").open("w", newline="") as f:
         fields = list(all_rows[0].keys()) if all_rows else ["config", "coin", "period"]
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -368,8 +421,8 @@ async def main():
         writer.writerows(all_rows)
     report = {"purpose": "Compare signal frequency and trade quality on closed candles; research only.",
               "configs": CONFIGS, "summary": summaries, "cost_stress": cost_stress,
-              "per_coin": all_rows, "errors": errors,
-              "warning": "A single historical split is exploratory. Signals/day is an average across the tested coin-universe, not a promise. No production settings were changed."}
+              "walk_forward": walk_forward, "per_coin": all_rows, "errors": errors,
+              "warning": "Historical splits and walk-forward folds are exploratory. Signals/day is an average across the tested coin-universe, not a promise. No production settings were changed."}
     (OUT / "summary.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({"summary": summaries, "errors": errors}, indent=2))
     if errors:
