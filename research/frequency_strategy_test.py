@@ -165,6 +165,98 @@ async def load(session, coin, interval):
     return [c for c in candles if c.get("t") and now_ms - c["t"] >= interval_ms]
 
 
+
+def fast_regimes(candles, period=14):
+    """Linear-time equivalent of bot.classify_regime for research backtests."""
+    n = len(candles)
+    out = ["UNKNOWN"] * n
+    if n < 2:
+        return out
+
+    trs, plus_dm, minus_dm = [], [], []
+    for i in range(1, n):
+        h, l = candles[i]["h"], candles[i]["l"]
+        ph, pl, pc = candles[i - 1]["h"], candles[i - 1]["l"], candles[i - 1]["c"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        up, down = h - ph, pl - l
+        plus_dm.append(up if (up > down and up > 0) else 0.0)
+        minus_dm.append(down if (down > up and down > 0) else 0.0)
+
+    atr = None
+    adx = None
+    atr_sum = plus_sum = minus_sum = None
+    dx_values = []
+    closes = []
+
+    for idx, candle in enumerate(candles):
+        closes.append(candle["c"])
+        if idx == 0:
+            continue
+        j = idx - 1
+        tr = trs[j]
+        if j == period - 1:
+            atr = sum(trs[:period]) / period
+            atr_sum = sum(trs[:period])
+            plus_sum = sum(plus_dm[:period])
+            minus_sum = sum(minus_dm[:period])
+        elif j >= period:
+            atr = (atr * (period - 1) + tr) / period
+            atr_sum = atr_sum - atr_sum / period + tr
+            plus_sum = plus_sum - plus_sum / period + plus_dm[j]
+            minus_sum = minus_sum - minus_sum / period + minus_dm[j]
+
+        if j >= period - 1:
+            denom = plus_sum + minus_sum
+            dx_values.append(100 * abs(plus_sum - minus_sum) / denom if denom else 0.0)
+            if len(dx_values) == period:
+                adx = sum(dx_values[:period]) / period
+            elif len(dx_values) > period:
+                adx = (adx * (period - 1) + dx_values[-1]) / period
+
+        if idx < 29:
+            continue
+        # bot.compute_adx returns None until 2*period candles.
+        # Its DX series has period-valid values beginning at candle index 2*period.
+        if idx < period * 2:
+            adx_value = None
+        else:
+            adx_value = adx
+        price = candle["c"]
+        atr_pct = (atr / price * 100) if (atr and price) else 0.0
+        if atr_pct > bot.ATR_VOLATILE_PCT:
+            out[idx] = "VOLATILE"
+        elif adx_value is None:
+            out[idx] = "UNKNOWN"
+        elif adx_value < bot.ADX_TREND_THRESHOLD:
+            out[idx] = "RANGE"
+        else:
+            sma20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else None
+            sma50 = sum(closes[-50:]) / 50 if len(closes) >= 50 else None
+            if sma20 and sma50:
+                out[idx] = "TREND_UP" if sma20 > sma50 else "TREND_DOWN"
+            else:
+                out[idx] = "UNKNOWN"
+    return out
+
+
+def validated_fast_regimes(candles):
+    """Cross-check the optimized regime calculation against production logic."""
+    fast = fast_regimes(candles)
+    if len(candles) < 30:
+        return fast
+    # Deterministic spread of checks, including early and late history.
+    checks = sorted(set([29, 30, 55, len(candles) // 4, len(candles) // 2,
+                         (3 * len(candles)) // 4, len(candles) - 1]))
+    for idx in checks:
+        if idx >= 0 and idx < len(candles):
+            expected = bot.classify_regime(candles, idx)
+            if fast[idx] != expected:
+                raise RuntimeError(
+                    f"fast regime mismatch at idx={idx}: {fast[idx]} != {expected}"
+                )
+    return fast
+
+
 async def main():
     errors, results, all_rows = [], [], []
     regimes_cache = {}
@@ -186,7 +278,7 @@ async def main():
                     split_time = candles[split]["t"]
                     regime_key = (coin, interval)
                     if regime_key not in regimes_cache:
-                        regimes_cache[regime_key] = [bot.classify_regime(candles, idx) for idx in range(len(candles))]
+                        regimes_cache[regime_key] = validated_fast_regimes(candles)
                     regimes = regimes_cache[regime_key]
                     train_trades = run(candles[:split], cfg, regimes[:split])
                     test_start = max(0, split - 200)
