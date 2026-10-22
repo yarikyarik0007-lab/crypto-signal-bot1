@@ -55,11 +55,22 @@ CONFIGS = [
 ]
 
 
-def run(candles, cfg, regimes=None, htf_regimes=None):
+def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_idx=None):
+    """Simulate only entries and exits inside [start_idx, end_idx).
+
+    Earlier candles are available only for causal indicator/pivot warm-up. The
+    pending-setup queue and position state are reset at each evaluation window.
+    Trades still open at the window boundary are censored, not marked to market.
+    """
+    n = len(candles)
+    end_idx = n if end_idx is None else min(n, max(0, end_idx))
+    min_start = bot.BT_ZONE_LOOKBACK + bot.BT_PIVOT_WINDOW + 2
+    i = max(min_start, max(0, start_idx))
+    if end_idx <= i + 1:
+        return []
+
     trades, pending = [], []
-    start = bot.BT_ZONE_LOOKBACK + bot.BT_PIVOT_WINDOW + 2
-    i = start
-    while i < len(candles) - 1:
+    while i < end_idx - 1:
         sig = candles[i]
         pending = [p for p in pending if i - p["breakout_i"] <= cfg["window"]]
         triggered = None
@@ -92,7 +103,6 @@ def run(candles, cfg, regimes=None, htf_regimes=None):
         if triggered:
             pending = [p for p in pending if p is not triggered]
             direction, level = triggered["dir"], triggered["level"]
-
             entry = candles[i + 1]["o"]
             if direction == "LONG":
                 sl = min(level * (1 - 0.005), sig["l"] * 0.998)
@@ -107,29 +117,37 @@ def run(candles, cfg, regimes=None, htf_regimes=None):
                 continue
 
             exit_r, exit_i, exit_reason = None, None, None
-            for k in range(i + 1, len(candles)):
+            # Crucially, never inspect candles beyond this evaluation window.
+            for k in range(i + 1, end_idx):
                 c = candles[k]
                 if direction == "LONG":
                     hit_sl, hit_tp = c["l"] <= sl, c["h"] >= tp
                 else:
                     hit_sl, hit_tp = c["h"] >= sl, c["l"] <= tp
+                # Conservative tie-break: if both hit in one candle, assume stop first.
                 if hit_sl:
                     exit_r, exit_i, exit_reason = -1.0, k, "stop"
                     break
                 if hit_tp:
                     exit_r, exit_i, exit_reason = bot.BT_RR_TARGET, k, "target"
                     break
-            if exit_r is None:
-                c = candles[-1]["c"]
-                exit_r = (c - entry) / risk if direction == "LONG" else (entry - c) / risk
-                exit_i, exit_reason = len(candles) - 1, "data_end"
-            exit_r -= bot.BT_FEE_R
+
+            censored = exit_r is None
+            if censored:
+                exit_i, exit_reason = end_idx - 1, "censored_window_end"
+                trade_r = None
+            else:
+                exit_r -= bot.BT_FEE_R
+                trade_r = round(exit_r, 4)
             trades.append({
                 "direction": direction, "entry_i": i + 1, "exit_i": exit_i,
                 "entry_time": candles[i + 1].get("t"), "exit_time": candles[exit_i].get("t"),
-                "r": round(exit_r, 4), "exit_reason": exit_reason, "regime": regime,
+                "r": trade_r, "exit_reason": exit_reason, "regime": regime,
+                "censored": censored,
             })
             pending = []
+            if censored:
+                break
             i = exit_i + 1
             continue
 
@@ -149,23 +167,48 @@ def run(candles, cfg, regimes=None, htf_regimes=None):
 
 
 def metrics(trades, days, extra_cost_r=0.0):
-    rs = [float(t["r"]) - extra_cost_r for t in trades]
-    wins = sum(x > 0 for x in rs)
-    gw = sum(x for x in rs if x > 0)
-    gl = -sum(x for x in rs if x < 0)
+    # Only fully resolved trades belong in performance statistics.
+    completed = [
+        t for t in trades
+        if t.get("r") is not None and not t.get("censored", False)
+    ]
+    rs = [(t, float(t["r"]) - extra_cost_r) for t in completed]
+    wins = sum(r > 0 for _, r in rs)
+    gross_wins = sum(r for _, r in rs if r > 0)
+    gross_losses = -sum(r for _, r in rs if r < 0)
+
+    # Realized equity changes at exit time, not entry time. Group simultaneous
+    # exits to avoid arbitrary ordering between assets that close on one candle.
+    by_exit_time = {}
+    for trade, r in rs:
+        key = trade.get("exit_time") or trade.get("entry_time") or 0
+        by_exit_time[key] = by_exit_time.get(key, 0.0) + r
     equity = peak = max_dd = 0.0
-    for x in rs:
-        equity += x
+    for key in sorted(by_exit_time):
+        equity += by_exit_time[key]
         peak = max(peak, equity)
         max_dd = max(max_dd, peak - equity)
+
     return {
-        "trades": len(rs), "wins": wins,
+        "trades": len(rs),
+        "censored_trades": sum(bool(t.get("censored")) for t in trades),
+        "wins": wins,
         "win_rate_pct": round(100 * wins / len(rs), 2) if rs else 0,
-        "profit_factor": round(gw / gl, 3) if gl else (999 if gw else 0),
-        "net_R": round(sum(rs), 3), "avg_R": round(sum(rs) / len(rs), 4) if rs else 0,
+        "profit_factor": round(gross_wins / gross_losses, 3) if gross_losses else (999 if gross_wins else 0),
+        "net_R": round(sum(r for _, r in rs), 3),
+        "avg_R": round(sum(r for _, r in rs) / len(rs), 4) if rs else 0,
         "max_drawdown_R": round(max_dd, 3),
         "signals_per_day": round(len(rs) / days, 3) if days > 0 else 0,
     }
+
+
+def add_cost_stress(row, trades, days):
+    for extra_cost_r in (0.05, 0.10):
+        stressed = metrics(trades, days, extra_cost_r=extra_cost_r)
+        suffix = f"{extra_cost_r:.2f}R"
+        row[f"net_R_after_extra_{suffix}"] = stressed["net_R"]
+        row[f"PF_after_extra_{suffix}"] = stressed["profit_factor"]
+    return row
 
 
 async def load(session, coin, interval):
@@ -312,12 +355,15 @@ async def main():
                             hi = bisect.bisect_right(high_times, cutoff) - 1
                             htf_regimes.append(high_regimes[hi] if hi >= 0 else "UNKNOWN")
                         htf_cache[regime_key] = htf_regimes
-                    train_trades = run(candles[:split], cfg, regimes[:split],
-                                       htf_regimes[:split] if htf_regimes is not None else None)
-                    test_start = max(0, split - 200)
-                    test_all = run(candles[test_start:], cfg, regimes[test_start:],
-                                   htf_regimes[test_start:] if htf_regimes is not None else None)
-                    test_trades = [t for t in test_all if (t.get("entry_time") or 0) >= split_time]
+                    # Train and holdout are independent evaluation windows. Historical
+                    # candles remain available for causal indicator/pivot warm-up, but
+                    # pending setups and open positions do not cross the boundary.
+                    train_trades = run_window(
+                        candles, cfg, regimes, htf_regimes, start_idx=0, end_idx=split
+                    )
+                    test_trades = run_window(
+                        candles, cfg, regimes, htf_regimes, start_idx=split, end_idx=len(candles)
+                    )
                     trades_cache[(cfg["name"], coin, "train")] = train_trades
                     trades_cache[(cfg["name"], coin, "holdout")] = test_trades
                     train_days = max(1, (candles[split - 1]["t"] - candles[0]["t"]) / 86400000)
@@ -361,16 +407,24 @@ async def main():
                     **metrics(trades, days, extra_cost_r=extra_cost_r),
                 })
 
-    # Rolling-origin validation on three later, non-overlapping entry windows.
-    # Each fold uses only candles available at/after its entry window, while retaining
-    # a warm-up history for pivots/regime labels. This is exploratory, not a guarantee.
+    # Five sequential out-of-sample windows. Each fold starts flat, uses
+    # only past candles for warm-up, and censors positions that remain open at
+    # the fold boundary. No fold can borrow a future exit from a later window.
     walk_forward = []
     shortlist = {
         "A_4h_current_short_only",
+        "B_1h_current_short_only",
+        "B1_1h_long_only",
+        "C_1h_balanced_both_directions",
+        "D_1h_more_opportunities",
+        "B2_2h_current_short_only",
+        "B3_2h_long_only",
+        "C2_2h_balanced_both_directions",
         "F_2h_long_confirmed_by_4h",
         "F3_2h_long_confirmed_by_4h_strict",
+        "F4_2h_long_confirmed_by_4h_balanced",
     }
-    folds = [(0.50, 0.65), (0.65, 0.80), (0.80, 1.00)]
+    folds = [(0.20, 0.36), (0.36, 0.52), (0.52, 0.68), (0.68, 0.84), (0.84, 1.00)]
     for cfg in CONFIGS:
         if cfg["name"] not in shortlist:
             continue
@@ -386,32 +440,29 @@ async def main():
                 end_idx = min(len(candles), int(len(candles) * end_frac))
                 if end_idx <= start_idx + 30:
                     continue
-                context_start = max(0, start_idx - 200)
                 regime_key = (coin, cfg["interval"])
                 regimes = regimes_cache[regime_key]
                 htf_regimes = htf_cache.get(regime_key)
-                segment = candles[context_start:]
-                segment_regimes = regimes[context_start:]
-                segment_htf = htf_regimes[context_start:] if htf_regimes is not None else None
-                candidate_trades = run(segment, cfg, segment_regimes, segment_htf)
-                start_time = candles[start_idx]["t"]
-                end_time = candles[end_idx]["t"] if end_idx < len(candles) else candles[-1]["t"] + 1
-                selected = [t for t in candidate_trades
-                            if start_time <= (t.get("entry_time") or 0) < end_time]
+                selected = run_window(
+                    candles, cfg, regimes, htf_regimes,
+                    start_idx=start_idx, end_idx=end_idx,
+                )
                 fold_trades.extend(selected)
-                days = max(1, (end_time - start_time) / 86400000)
+                days = max(1, (candles[end_idx - 1]["t"] - candles[start_idx]["t"]) / 86400000)
                 fold_days.append(days)
-                fold_coin_rows.append({
+                coin_row = {
                     "config": cfg["name"], "fold": fold_no, "coin": coin,
                     "start_fraction": start_frac, "end_fraction": end_frac,
                     **metrics(selected, days),
-                })
+                }
+                fold_coin_rows.append(add_cost_stress(coin_row, selected, days))
             avg_days = sum(fold_days) / len(fold_days) if fold_days else 1
-            walk_forward.append({
+            fold_row = {
                 "config": cfg["name"], "fold": fold_no,
                 "start_fraction": start_frac, "end_fraction": end_frac,
                 **metrics(fold_trades, avg_days),
-            })
+            }
+            walk_forward.append(add_cost_stress(fold_row, fold_trades, avg_days))
             walk_forward.extend(fold_coin_rows)
 
     with (OUT / "per_coin.csv").open("w", newline="") as f:
