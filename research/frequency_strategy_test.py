@@ -383,13 +383,9 @@ async def main():
     for cfg in CONFIGS:
         for period in ("train", "holdout"):
             rows = [r for r in all_rows if r["config"] == cfg["name"] and r["period"] == period]
-            total = sum(r["trades"] for r in rows)
-            wins = sum(r["wins"] for r in rows)
-            gw = sum(max(0, r["net_R"]) for r in [])  # gross values computed from trade rows below
             trades = []
             for coin in COINS:
                 trades.extend(trades_cache.get((cfg["name"], coin, period), []))
-            trade_rs = [float(t["r"]) for t in trades]
             days = sum((max(1, (cache[(coin, cfg["interval"])][int(len(cache[(coin, cfg["interval"])])*TRAIN_FRACTION)-1]["t"] -
                                 cache[(coin, cfg["interval"])][0]["t"]) / 86400000)
                         if period == "train" else
