@@ -558,6 +558,128 @@ async def main():
             walk_forward.append(add_cost_stress(fold_row, fold_trades, fold_days))
             walk_forward.extend(fold_coin_rows)
 
+    # Nested, chronological model-selection check. For each interval, choose a
+    # predeclared candidate using only earlier walk-forward folds, then score it
+    # on the next fold. This is stricter than selecting the best config after
+    # inspecting all five folds. Extra 0.10R/trade is used for ranking.
+    aggregate_wf = [r for r in walk_forward if "coin" not in r]
+    nested_walk_forward = []
+
+    def combine_stressed_fold_rows(rows):
+        total_trades = sum(int(r.get("trades", 0)) for r in rows)
+        net = sum(float(r.get("net_R_after_extra_0.10R", 0.0)) for r in rows)
+        gross_win = 0.0
+        gross_loss = 0.0
+        pf_reconstructable = True
+        for row in rows:
+            row_net = float(row.get("net_R_after_extra_0.10R", 0.0))
+            row_pf = float(row.get("PF_after_extra_0.10R", 0.0))
+            if row_pf >= 999:
+                gross_win += max(0.0, row_net)
+            elif row_pf <= 0:
+                gross_loss += max(0.0, -row_net)
+            elif abs(row_pf - 1.0) < 1e-6:
+                # PF=1 loses information after rounding; conservatively mark
+                # the aggregate PF as unavailable for candidate eligibility.
+                pf_reconstructable = False
+            else:
+                row_win = row_net * row_pf / (row_pf - 1.0)
+                row_loss = row_win - row_net
+                if row_win < -1e-5 or row_loss < -1e-5:
+                    pf_reconstructable = False
+                else:
+                    gross_win += max(0.0, row_win)
+                    gross_loss += max(0.0, row_loss)
+        combined_pf = (
+            round(gross_win / gross_loss, 3) if gross_loss > 0
+            else (999 if gross_win > 0 else 0)
+        ) if pf_reconstructable else 0
+        return {
+            "trades": total_trades,
+            "net_R_after_extra_0.10R": round(net, 3),
+            "PF_after_extra_0.10R": combined_pf,
+            "max_fold_drawdown_R": round(max(
+                (float(r.get("max_drawdown_R", 0.0)) for r in rows), default=0.0
+            ), 3),
+        }
+
+    for interval in sorted({cfg["interval"] for cfg in CONFIGS}):
+        candidates = [
+            cfg for cfg in CONFIGS
+            if cfg["interval"] == interval and cfg["name"] in shortlist
+        ]
+        interval_folds = sorted({
+            int(r["fold"]) for r in aggregate_wf
+            if r["config"] in {cfg["name"] for cfg in candidates}
+        })
+        for test_fold in interval_folds:
+            prior_folds = [fold for fold in interval_folds if fold < test_fold]
+            if not prior_folds:
+                continue
+            ranked = []
+            for cfg in candidates:
+                prior_rows = [
+                    r for r in aggregate_wf
+                    if r["config"] == cfg["name"] and int(r["fold"]) in prior_folds
+                ]
+                train_stats = combine_stressed_fold_rows(prior_rows)
+                if (
+                    train_stats["trades"] >= 30
+                    and train_stats["net_R_after_extra_0.10R"] > 0
+                    and train_stats["PF_after_extra_0.10R"] > 1.0
+                ):
+                    ranked.append((train_stats, cfg))
+            if not ranked:
+                nested_walk_forward.append({
+                    "interval": interval,
+                    "test_fold": test_fold,
+                    "selection_folds": prior_folds,
+                    "selected_config": None,
+                    "status": "no_candidate_met_prior-fold minimums",
+                })
+                continue
+            train_stats, selected_cfg = max(
+                ranked,
+                key=lambda item: (
+                    item[0]["net_R_after_extra_0.10R"],
+                    item[0]["PF_after_extra_0.10R"],
+                    -item[0]["max_fold_drawdown_R"],
+                ),
+            )
+            test_rows = [
+                r for r in aggregate_wf
+                if r["config"] == selected_cfg["name"] and int(r["fold"]) == test_fold
+            ]
+            if not test_rows:
+                nested_walk_forward.append({
+                    "interval": interval,
+                    "test_fold": test_fold,
+                    "selection_folds": prior_folds,
+                    "selected_config": selected_cfg["name"],
+                    "status": "missing test-fold result",
+                })
+                continue
+            test_row = test_rows[0]
+            nested_walk_forward.append({
+                "interval": interval,
+                "test_fold": test_fold,
+                "selection_folds": prior_folds,
+                "selected_config": selected_cfg["name"],
+                "selection_trades": train_stats["trades"],
+                "selection_net_R_after_extra_0.10R": train_stats["net_R_after_extra_0.10R"],
+                "selection_PF_after_extra_0.10R": train_stats["PF_after_extra_0.10R"],
+                "test_trades": test_row["trades"],
+                "test_win_rate_pct": test_row["win_rate_pct"],
+                "test_profit_factor": test_row["profit_factor"],
+                "test_net_R": test_row["net_R"],
+                "test_net_R_after_extra_0.05R": test_row["net_R_after_extra_0.05R"],
+                "test_PF_after_extra_0.05R": test_row["PF_after_extra_0.05R"],
+                "test_net_R_after_extra_0.10R": test_row["net_R_after_extra_0.10R"],
+                "test_PF_after_extra_0.10R": test_row["PF_after_extra_0.10R"],
+                "test_max_drawdown_R": test_row["max_drawdown_R"],
+                "status": "evaluated",
+            })
+
     with (OUT / "per_coin.csv").open("w", newline="") as f:
         fields = list(all_rows[0].keys()) if all_rows else ["config", "coin", "period"]
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -576,8 +698,8 @@ async def main():
         "purpose": "Compare signal frequency and trade quality on closed candles; research only.",
         "configs": CONFIGS, "calendar_windows": calendar_windows,
         "summary": summaries, "cost_stress": cost_stress,
-        "walk_forward": walk_forward, "per_coin": all_rows, "errors": errors,
-        "warning": "Research only. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. Fold positions are reset and unresolved trades are censored. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
+        "walk_forward": walk_forward, "nested_walk_forward": nested_walk_forward, "per_coin": all_rows, "errors": errors,
+        "warning": "Research only. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.10R/trade stress. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
     }
     (OUT / "summary.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({"summary": summaries, "errors": errors}, indent=2))
