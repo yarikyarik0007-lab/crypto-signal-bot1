@@ -404,7 +404,6 @@ async def main():
                         if htf_key not in regimes_cache:
                             regimes_cache[htf_key] = validated_fast_regimes(high_candles)
                         high_regimes = regimes_cache[htf_key]
-                        import bisect
                         high_times = [c["t"] for c in high_candles]
                         lower_ms = {"1h": 3600000, "2h": 7200000, "4h": 14400000}[interval]
                         high_ms = {"1h": 3600000, "2h": 7200000, "4h": 14400000}[cfg["htf"]]
