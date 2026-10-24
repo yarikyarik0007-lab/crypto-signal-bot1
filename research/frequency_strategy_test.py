@@ -63,6 +63,10 @@ CONFIGS = [
      "tol": 0.006, "window": 8, "mode": "long_htf", "htf": "4h", "rr_target": 1.5},
     {"name": "F9_2h_long_confirmed_by_4h_rr_2_5", "interval": "2h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "long_htf", "htf": "4h", "rr_target": 2.5},
+    {"name": "F10_2h_long_confirmed_by_local_and_4h", "interval": "2h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "long_dual_htf", "htf": "4h"},
+    {"name": "F11_2h_short_confirmed_by_local_and_4h", "interval": "2h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short_dual_htf", "htf": "4h"},
 ]
 
 
@@ -98,6 +102,14 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
             if cfg["mode"] == "long_htf" and (p["dir"] != "LONG" or htf_regime != "TREND_UP"):
                 continue
             if cfg["mode"] == "short_htf" and (p["dir"] != "SHORT" or htf_regime != "TREND_DOWN"):
+                continue
+            if cfg["mode"] == "long_dual_htf" and (
+                p["dir"] != "LONG" or regime != "TREND_UP" or htf_regime != "TREND_UP"
+            ):
+                continue
+            if cfg["mode"] == "short_dual_htf" and (
+                p["dir"] != "SHORT" or regime != "TREND_DOWN" or htf_regime != "TREND_DOWN"
+            ):
                 continue
             if cfg["mode"] == "trend_both_htf":
                 if (p["dir"] == "LONG" and htf_regime != "TREND_UP") or (
@@ -494,6 +506,8 @@ async def main():
         "F7_2h_short_confirmed_by_4h",
         "F8_2h_long_confirmed_by_4h_rr_1_5",
         "F9_2h_long_confirmed_by_4h_rr_2_5",
+        "F10_2h_long_confirmed_by_local_and_4h",
+        "F11_2h_short_confirmed_by_local_and_4h",
     }
     folds = [(0.20, 0.36), (0.36, 0.52), (0.52, 0.68), (0.68, 0.84), (0.84, 1.00)]
     for cfg in CONFIGS:
