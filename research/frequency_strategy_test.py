@@ -67,6 +67,10 @@ CONFIGS = [
      "tol": 0.006, "window": 8, "mode": "long_dual_htf", "htf": "4h"},
     {"name": "F11_2h_short_confirmed_by_local_and_4h", "interval": "2h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "short_dual_htf", "htf": "4h"},
+    {"name": "F12_2h_long_dual_htf_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_dual_htf", "htf": "4h"},
+    {"name": "F13_2h_short_dual_htf_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "short_dual_htf", "htf": "4h"},
 ]
 
 
@@ -227,6 +231,8 @@ def metrics(trades, days, extra_cost_r=0.0):
         "win_rate_pct": round(100 * wins / len(rs), 2) if rs else 0,
         "profit_factor": round(gross_wins / gross_losses, 3) if gross_losses else (999 if gross_wins else 0),
         "net_R": round(sum(r for _, r in rs), 3),
+        "gross_profit_R": round(gross_wins, 6),
+        "gross_loss_R": round(gross_losses, 6),
         "avg_R": round(sum(r for _, r in rs) / len(rs), 4) if rs else 0,
         "max_drawdown_R": round(max_dd, 3),
         "signals_per_day": round(len(rs) / days, 3) if days > 0 else 0,
@@ -234,11 +240,15 @@ def metrics(trades, days, extra_cost_r=0.0):
 
 
 def add_cost_stress(row, trades, days):
-    for extra_cost_r in (0.05, 0.10):
+    for extra_cost_r in (0.05, 0.10, 0.15):
         stressed = metrics(trades, days, extra_cost_r=extra_cost_r)
         suffix = f"{extra_cost_r:.2f}R"
         row[f"net_R_after_extra_{suffix}"] = stressed["net_R"]
         row[f"PF_after_extra_{suffix}"] = stressed["profit_factor"]
+        row[f"win_rate_pct_after_extra_{suffix}"] = stressed["win_rate_pct"]
+        row[f"max_drawdown_R_after_extra_{suffix}"] = stressed["max_drawdown_R"]
+        row[f"gross_profit_R_after_extra_{suffix}"] = stressed["gross_profit_R"]
+        row[f"gross_loss_R_after_extra_{suffix}"] = stressed["gross_loss_R"]
     return row
 
 
@@ -508,6 +518,8 @@ async def main():
         "F9_2h_long_confirmed_by_4h_rr_2_5",
         "F10_2h_long_confirmed_by_local_and_4h",
         "F11_2h_short_confirmed_by_local_and_4h",
+        "F12_2h_long_dual_htf_strict",
+        "F13_2h_short_dual_htf_strict",
     }
     folds = [(0.20, 0.36), (0.36, 0.52), (0.52, 0.68), (0.68, 0.84), (0.84, 1.00)]
     for cfg in CONFIGS:
@@ -568,38 +580,18 @@ async def main():
     def combine_stressed_fold_rows(rows):
         total_trades = sum(int(r.get("trades", 0)) for r in rows)
         net = sum(float(r.get("net_R_after_extra_0.10R", 0.0)) for r in rows)
-        gross_win = 0.0
-        gross_loss = 0.0
-        pf_reconstructable = True
-        for row in rows:
-            row_net = float(row.get("net_R_after_extra_0.10R", 0.0))
-            row_pf = float(row.get("PF_after_extra_0.10R", 0.0))
-            if row_pf >= 999:
-                gross_win += max(0.0, row_net)
-            elif row_pf <= 0:
-                gross_loss += max(0.0, -row_net)
-            elif abs(row_pf - 1.0) < 1e-6:
-                # PF=1 loses information after rounding; conservatively mark
-                # the aggregate PF as unavailable for candidate eligibility.
-                pf_reconstructable = False
-            else:
-                row_win = row_net * row_pf / (row_pf - 1.0)
-                row_loss = row_win - row_net
-                if row_win < -1e-5 or row_loss < -1e-5:
-                    pf_reconstructable = False
-                else:
-                    gross_win += max(0.0, row_win)
-                    gross_loss += max(0.0, row_loss)
+        gross_win = sum(float(r.get("gross_profit_R_after_extra_0.10R", 0.0)) for r in rows)
+        gross_loss = sum(float(r.get("gross_loss_R_after_extra_0.10R", 0.0)) for r in rows)
         combined_pf = (
             round(gross_win / gross_loss, 3) if gross_loss > 0
             else (999 if gross_win > 0 else 0)
-        ) if pf_reconstructable else 0
+        )
         return {
             "trades": total_trades,
             "net_R_after_extra_0.10R": round(net, 3),
             "PF_after_extra_0.10R": combined_pf,
             "max_fold_drawdown_R": round(max(
-                (float(r.get("max_drawdown_R", 0.0)) for r in rows), default=0.0
+                (float(r.get("max_drawdown_R_after_extra_0.10R", 0.0)) for r in rows), default=0.0
             ), 3),
         }
 
@@ -680,6 +672,60 @@ async def main():
                 "status": "evaluated",
             })
 
+    # Leave-one-coin-out robustness for the baseline and the most informative
+    # LONG/SHORT candidates. This checks whether aggregate performance depends
+    # on a single asset; all costs are applied trade-by-trade before PF/DD.
+    robustness_names = {
+        "A_4h_current_short_only",
+        "F_2h_long_confirmed_by_4h",
+        "F3_2h_long_confirmed_by_4h_strict",
+        "F8_2h_long_confirmed_by_4h_rr_1_5",
+        "F9_2h_long_confirmed_by_4h_rr_2_5",
+        "F10_2h_long_confirmed_by_local_and_4h",
+        "F11_2h_short_confirmed_by_local_and_4h",
+        "F12_2h_long_dual_htf_strict",
+        "F13_2h_short_dual_htf_strict",
+    }
+    leave_one_coin_out = []
+    for cfg in CONFIGS:
+        if cfg["name"] not in robustness_names:
+            continue
+        bounds = interval_bounds.get(cfg["interval"])
+        if not bounds:
+            continue
+        _, evaluation_start, common_end = bounds
+        split_time = int(evaluation_start + (common_end - evaluation_start) * TRAIN_FRACTION)
+        period_days = {
+            "train": max(1, (split_time - evaluation_start) / 86400000),
+            "holdout": max(1, (common_end - split_time) / 86400000),
+        }
+        for period in ("train", "holdout"):
+            for excluded_coin in [None, *COINS]:
+                combined = []
+                for coin in COINS:
+                    if excluded_coin is not None and coin == excluded_coin:
+                        continue
+                    combined.extend(trades_cache.get((cfg["name"], coin, period), []))
+                base_stats = metrics(combined, period_days[period])
+                stressed_010 = metrics(combined, period_days[period], extra_cost_r=0.10)
+                stressed_015 = metrics(combined, period_days[period], extra_cost_r=0.15)
+                leave_one_coin_out.append({
+                    "config": cfg["name"],
+                    "period": period,
+                    "excluded_coin": excluded_coin or "NONE",
+                    "trades": base_stats["trades"],
+                    "win_rate_pct": base_stats["win_rate_pct"],
+                    "profit_factor": base_stats["profit_factor"],
+                    "net_R": base_stats["net_R"],
+                    "max_drawdown_R": base_stats["max_drawdown_R"],
+                    "net_R_after_extra_0.10R": stressed_010["net_R"],
+                    "PF_after_extra_0.10R": stressed_010["profit_factor"],
+                    "max_drawdown_R_after_extra_0.10R": stressed_010["max_drawdown_R"],
+                    "net_R_after_extra_0.15R": stressed_015["net_R"],
+                    "PF_after_extra_0.15R": stressed_015["profit_factor"],
+                    "max_drawdown_R_after_extra_0.15R": stressed_015["max_drawdown_R"],
+                })
+
     with (OUT / "per_coin.csv").open("w", newline="") as f:
         fields = list(all_rows[0].keys()) if all_rows else ["config", "coin", "period"]
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -698,8 +744,9 @@ async def main():
         "purpose": "Compare signal frequency and trade quality on closed candles; research only.",
         "configs": CONFIGS, "calendar_windows": calendar_windows,
         "summary": summaries, "cost_stress": cost_stress,
-        "walk_forward": walk_forward, "nested_walk_forward": nested_walk_forward, "per_coin": all_rows, "errors": errors,
-        "warning": "Research only. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.10R/trade stress. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
+        "walk_forward": walk_forward, "nested_walk_forward": nested_walk_forward,
+        "leave_one_coin_out": leave_one_coin_out, "per_coin": all_rows, "errors": errors,
+        "warning": "Research only. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.10R/trade stress using trade-level gross profit/loss aggregation. Additional +0.15R stress and leave-one-coin-out checks are included. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
     }
     (OUT / "summary.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({"summary": summaries, "errors": errors}, indent=2))
