@@ -59,6 +59,10 @@ CONFIGS = [
      "tol": 0.006, "window": 8, "mode": "trend_both_htf", "htf": "4h"},
     {"name": "F7_2h_short_confirmed_by_4h", "interval": "2h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "short_htf", "htf": "4h"},
+    {"name": "F8_2h_long_confirmed_by_4h_rr_1_5", "interval": "2h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "long_htf", "htf": "4h", "rr_target": 1.5},
+    {"name": "F9_2h_long_confirmed_by_4h_rr_2_5", "interval": "2h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "long_htf", "htf": "4h", "rr_target": 2.5},
 ]
 
 
@@ -77,6 +81,7 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
         return []
 
     trades, pending = [], []
+    rr_target = float(cfg.get("rr_target", bot.BT_RR_TARGET))
     while i < end_idx - 1:
         sig = candles[i]
         pending = [p for p in pending if i - p["breakout_i"] <= cfg["window"]]
@@ -121,11 +126,11 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
             if direction == "LONG":
                 sl = min(level * (1 - 0.005), sig["l"] * 0.998)
                 risk = entry - sl
-                tp = entry + bot.BT_RR_TARGET * risk
+                tp = entry + rr_target * risk
             else:
                 sl = max(level * (1 + 0.005), sig["h"] * 1.002)
                 risk = sl - entry
-                tp = entry - bot.BT_RR_TARGET * risk
+                tp = entry - rr_target * risk
             if risk <= 0:
                 i += 1
                 continue
@@ -143,7 +148,7 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
                     exit_r, exit_i, exit_reason = -1.0, k, "stop"
                     break
                 if hit_tp:
-                    exit_r, exit_i, exit_reason = bot.BT_RR_TARGET, k, "target"
+                    exit_r, exit_i, exit_reason = rr_target, k, "target"
                     break
 
             censored = exit_r is None
@@ -487,6 +492,8 @@ async def main():
         "F5_1h_short_confirmed_by_4h",
         "F6_1h_both_directions_confirmed_by_4h",
         "F7_2h_short_confirmed_by_4h",
+        "F8_2h_long_confirmed_by_4h_rr_1_5",
+        "F9_2h_long_confirmed_by_4h_rr_2_5",
     }
     folds = [(0.20, 0.36), (0.36, 0.52), (0.52, 0.68), (0.68, 0.84), (0.84, 1.00)]
     for cfg in CONFIGS:
