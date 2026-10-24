@@ -4,6 +4,7 @@ import csv
 import json
 import os
 import sys
+import bisect
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -52,6 +53,12 @@ CONFIGS = [
      "tol": 0.005, "window": 6, "mode": "long_htf", "htf": "4h"},
     {"name": "F4_2h_long_confirmed_by_4h_balanced", "interval": "2h", "margin": 0.003, "volume": 0.8,
      "tol": 0.008, "window": 12, "mode": "long_htf", "htf": "4h"},
+    {"name": "F5_1h_short_confirmed_by_4h", "interval": "1h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short_htf", "htf": "4h"},
+    {"name": "F6_1h_both_directions_confirmed_by_4h", "interval": "1h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "trend_both_htf", "htf": "4h"},
+    {"name": "F7_2h_short_confirmed_by_4h", "interval": "2h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short_htf", "htf": "4h"},
 ]
 
 
@@ -85,6 +92,13 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
                 continue
             if cfg["mode"] == "long_htf" and (p["dir"] != "LONG" or htf_regime != "TREND_UP"):
                 continue
+            if cfg["mode"] == "short_htf" and (p["dir"] != "SHORT" or htf_regime != "TREND_DOWN"):
+                continue
+            if cfg["mode"] == "trend_both_htf":
+                if (p["dir"] == "LONG" and htf_regime != "TREND_UP") or (
+                    p["dir"] == "SHORT" and htf_regime != "TREND_DOWN"
+                ):
+                    continue
             if cfg["mode"] == "trend_both":
                 if (p["dir"] == "LONG" and regime != "TREND_UP") or (
                     p["dir"] == "SHORT" and regime != "TREND_DOWN"
@@ -318,6 +332,39 @@ async def main():
     trades_cache = {}
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         cache = {}
+        intervals_needed = sorted(
+            {cfg["interval"] for cfg in CONFIGS}
+            | {cfg["htf"] for cfg in CONFIGS if cfg.get("htf")}
+        )
+        interval_ms_map = {"1h": 3600000, "2h": 7200000, "4h": 14400000}
+        # Preload all histories first so every coin in an interval uses the same
+        # UTC calendar boundaries rather than a coin-specific fraction of its data.
+        for interval in intervals_needed:
+            for coin in COINS:
+                key = (coin, interval)
+                if key not in cache:
+                    try:
+                        cache[key] = await load(session, coin, interval)
+                    except Exception:
+                        cache[key] = []
+
+        interval_bounds = {}
+        warmup_bars = bot.BT_ZONE_LOOKBACK + bot.BT_PIVOT_WINDOW + 2
+        for interval in intervals_needed:
+            histories = [cache.get((coin, interval), []) for coin in COINS]
+            if not histories or any(len(history) < 500 for history in histories):
+                continue
+            common_start = max(history[0]["t"] for history in histories)
+            common_end = min(history[-1]["t"] for history in histories)
+            evaluation_start = common_start + warmup_bars * interval_ms_map[interval]
+            if common_end <= evaluation_start:
+                errors.append({
+                    "interval": interval,
+                    "error": "insufficient common UTC history after indicator warm-up",
+                })
+                continue
+            interval_bounds[interval] = (common_start, evaluation_start, common_end)
+
         for cfg in CONFIGS:
             interval = cfg["interval"]
             for coin in COINS:
@@ -330,8 +377,20 @@ async def main():
                         errors.append({"coin": coin, "interval": interval,
                                        "error": f"only {len(candles)} closed candles"})
                         continue
-                    split = int(len(candles) * TRAIN_FRACTION)
-                    split_time = candles[split]["t"]
+                    if interval not in interval_bounds:
+                        errors.append({"coin": coin, "interval": interval,
+                                       "error": "common UTC calendar bounds unavailable"})
+                        continue
+                    common_start, evaluation_start, common_end = interval_bounds[interval]
+                    candle_times = [c["t"] for c in candles]
+                    evaluation_start_idx = bisect.bisect_left(candle_times, evaluation_start)
+                    split_time = int(evaluation_start + (common_end - evaluation_start) * TRAIN_FRACTION)
+                    split = bisect.bisect_left(candle_times, split_time)
+                    evaluation_end_idx = bisect.bisect_right(candle_times, common_end)
+                    if split <= evaluation_start_idx or evaluation_end_idx <= split:
+                        errors.append({"coin": coin, "interval": interval,
+                                       "error": "invalid train/holdout boundaries"})
+                        continue
                     regime_key = (coin, interval)
                     if regime_key not in regimes_cache:
                         regimes_cache[regime_key] = validated_fast_regimes(candles)
@@ -359,20 +418,27 @@ async def main():
                     # candles remain available for causal indicator/pivot warm-up, but
                     # pending setups and open positions do not cross the boundary.
                     train_trades = run_window(
-                        candles, cfg, regimes, htf_regimes, start_idx=0, end_idx=split
+                        candles, cfg, regimes, htf_regimes,
+                        start_idx=evaluation_start_idx, end_idx=split
                     )
                     test_trades = run_window(
-                        candles, cfg, regimes, htf_regimes, start_idx=split, end_idx=len(candles)
+                        candles, cfg, regimes, htf_regimes,
+                        start_idx=split, end_idx=evaluation_end_idx
                     )
                     trades_cache[(cfg["name"], coin, "train")] = train_trades
                     trades_cache[(cfg["name"], coin, "holdout")] = test_trades
-                    train_days = max(1, (candles[split - 1]["t"] - candles[0]["t"]) / 86400000)
-                    test_days = max(1, (candles[-1]["t"] - split_time) / 86400000)
+                    train_days = max(1, (split_time - evaluation_start) / 86400000)
+                    test_days = max(1, (common_end - split_time) / 86400000)
                     for period, trades, days in (
                         ("train", train_trades, train_days), ("holdout", test_trades, test_days)
                     ):
-                        row = {"config": cfg["name"], "coin": coin, "period": period,
-                               "candles": len(candles), **metrics(trades, days)}
+                        row = {
+                            "config": cfg["name"], "coin": coin, "period": period,
+                            "candles": len(candles),
+                            "evaluation_start_utc": evaluation_start,
+                            "split_utc": split_time, "evaluation_end_utc": common_end,
+                            **metrics(trades, days),
+                        }
                         all_rows.append(row)
                     print(f"{cfg['name']} {coin}: train={len(train_trades)}, holdout={len(test_trades)}")
                 except Exception as exc:
@@ -386,13 +452,13 @@ async def main():
             trades = []
             for coin in COINS:
                 trades.extend(trades_cache.get((cfg["name"], coin, period), []))
-            days = sum((max(1, (cache[(coin, cfg["interval"])][int(len(cache[(coin, cfg["interval"])])*TRAIN_FRACTION)-1]["t"] -
-                                cache[(coin, cfg["interval"])][0]["t"]) / 86400000)
-                        if period == "train" else
-                        max(1, (cache[(coin, cfg["interval"])][-1]["t"] -
-                                cache[(coin, cfg["interval"])][int(len(cache[(coin, cfg["interval"])])*TRAIN_FRACTION)]["t"]) / 86400000))
-                       for coin in COINS if cache.get((coin, cfg["interval"])))
-            days = days / len(COINS) if COINS else 1
+            _, evaluation_start, common_end = interval_bounds[cfg["interval"]]
+            split_time = int(evaluation_start + (common_end - evaluation_start) * TRAIN_FRACTION)
+            days = (
+                max(1, (split_time - evaluation_start) / 86400000)
+                if period == "train"
+                else max(1, (common_end - split_time) / 86400000)
+            )
             summary = {"config": cfg["name"], "period": period,
                        **metrics(trades, days)}
             summaries.append(summary)
@@ -419,21 +485,31 @@ async def main():
         "F_2h_long_confirmed_by_4h",
         "F3_2h_long_confirmed_by_4h_strict",
         "F4_2h_long_confirmed_by_4h_balanced",
+        "F5_1h_short_confirmed_by_4h",
+        "F6_1h_both_directions_confirmed_by_4h",
+        "F7_2h_short_confirmed_by_4h",
     }
     folds = [(0.20, 0.36), (0.36, 0.52), (0.52, 0.68), (0.68, 0.84), (0.84, 1.00)]
     for cfg in CONFIGS:
         if cfg["name"] not in shortlist:
             continue
+        bounds = interval_bounds.get(cfg["interval"])
+        if not bounds:
+            continue
+        _, evaluation_start, common_end = bounds
+        calendar_span = common_end - evaluation_start
         for fold_no, (start_frac, end_frac) in enumerate(folds, start=1):
+            fold_start_utc = int(evaluation_start + calendar_span * start_frac)
+            fold_end_utc = int(evaluation_start + calendar_span * end_frac)
             fold_trades = []
-            fold_days = []
             fold_coin_rows = []
             for coin in COINS:
                 candles = cache.get((coin, cfg["interval"]), [])
                 if len(candles) < 500:
                     continue
-                start_idx = int(len(candles) * start_frac)
-                end_idx = min(len(candles), int(len(candles) * end_frac))
+                candle_times = [c["t"] for c in candles]
+                start_idx = bisect.bisect_left(candle_times, fold_start_utc)
+                end_idx = bisect.bisect_left(candle_times, fold_end_utc)
                 if end_idx <= start_idx + 30:
                     continue
                 regime_key = (coin, cfg["interval"])
@@ -444,21 +520,22 @@ async def main():
                     start_idx=start_idx, end_idx=end_idx,
                 )
                 fold_trades.extend(selected)
-                days = max(1, (candles[end_idx - 1]["t"] - candles[start_idx]["t"]) / 86400000)
-                fold_days.append(days)
+                days = max(1, (fold_end_utc - fold_start_utc) / 86400000)
                 coin_row = {
                     "config": cfg["name"], "fold": fold_no, "coin": coin,
                     "start_fraction": start_frac, "end_fraction": end_frac,
+                    "start_utc": fold_start_utc, "end_utc": fold_end_utc,
                     **metrics(selected, days),
                 }
                 fold_coin_rows.append(add_cost_stress(coin_row, selected, days))
-            avg_days = sum(fold_days) / len(fold_days) if fold_days else 1
+            fold_days = max(1, (fold_end_utc - fold_start_utc) / 86400000)
             fold_row = {
                 "config": cfg["name"], "fold": fold_no,
                 "start_fraction": start_frac, "end_fraction": end_frac,
-                **metrics(fold_trades, avg_days),
+                "start_utc": fold_start_utc, "end_utc": fold_end_utc,
+                **metrics(fold_trades, fold_days),
             }
-            walk_forward.append(add_cost_stress(fold_row, fold_trades, avg_days))
+            walk_forward.append(add_cost_stress(fold_row, fold_trades, fold_days))
             walk_forward.extend(fold_coin_rows)
 
     with (OUT / "per_coin.csv").open("w", newline="") as f:
@@ -466,10 +543,22 @@ async def main():
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(all_rows)
-    report = {"purpose": "Compare signal frequency and trade quality on closed candles; research only.",
-              "configs": CONFIGS, "summary": summaries, "cost_stress": cost_stress,
-              "walk_forward": walk_forward, "per_coin": all_rows, "errors": errors,
-              "warning": "Historical splits and walk-forward folds are exploratory. Signals/day is an average across the tested coin-universe, not a promise. No production settings were changed."}
+    calendar_windows = {}
+    for interval, (common_start, evaluation_start, common_end) in interval_bounds.items():
+        split_time = int(evaluation_start + (common_end - evaluation_start) * TRAIN_FRACTION)
+        calendar_windows[interval] = {
+            "common_history_start_utc": common_start,
+            "evaluation_start_utc": evaluation_start,
+            "train_holdout_split_utc": split_time,
+            "evaluation_end_utc": common_end,
+        }
+    report = {
+        "purpose": "Compare signal frequency and trade quality on closed candles; research only.",
+        "configs": CONFIGS, "calendar_windows": calendar_windows,
+        "summary": summaries, "cost_stress": cost_stress,
+        "walk_forward": walk_forward, "per_coin": all_rows, "errors": errors,
+        "warning": "Research only. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. Fold positions are reset and unresolved trades are censored. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
+    }
     (OUT / "summary.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({"summary": summaries, "errors": errors}, indent=2))
     if errors:
