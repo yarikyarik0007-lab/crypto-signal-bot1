@@ -33,7 +33,7 @@ jobs:
       - name: Run 4h baseline and 1h candidate comparisons
         run: python research/frequency_strategy_test.py
         env:
-          BT_CANDLES: '4000'
+          BT_CANDLES: '5000'
       - name: Upload frequency results
         if: always()
         uses: actions/upload-artifact@v4
