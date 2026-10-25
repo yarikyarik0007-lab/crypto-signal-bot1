@@ -87,6 +87,15 @@ CONFIGS = [
      "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 2.5},
     {"name": "F20_2h_short_local_and_btc4h_rr_2_5_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
      "tol": 0.005, "window": 6, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 2.5},
+    # Predeclared RR=2.0 sensitivity checks for BTC-regime filters; no new thresholds.
+    {"name": "F21_2h_long_btc4h_rr_2_0_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_market_htf", "market_htf": "4h", "rr_target": 2.0},
+    {"name": "F22_2h_long_local_and_btc4h_rr_2_0_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 2.0},
+    {"name": "F23_2h_short_btc4h_rr_2_0_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "short_market_htf", "market_htf": "4h", "rr_target": 2.0},
+    {"name": "F24_2h_short_local_and_btc4h_rr_2_0_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 2.0},
 ]
 
 
@@ -582,6 +591,10 @@ async def main():
         "F18_2h_short_btc4h_rr_2_5_strict",
         "F19_2h_long_local_and_btc4h_rr_2_5_strict",
         "F20_2h_short_local_and_btc4h_rr_2_5_strict",
+        "F21_2h_long_btc4h_rr_2_0_strict",
+        "F22_2h_long_local_and_btc4h_rr_2_0_strict",
+        "F23_2h_short_btc4h_rr_2_0_strict",
+        "F24_2h_short_local_and_btc4h_rr_2_0_strict",
     }
     folds = [(0.20, 0.36), (0.36, 0.52), (0.52, 0.68), (0.68, 0.84), (0.84, 1.00)]
     for cfg in CONFIGS:
@@ -777,6 +790,10 @@ async def main():
         "F18_2h_short_btc4h_rr_2_5_strict",
         "F19_2h_long_local_and_btc4h_rr_2_5_strict",
         "F20_2h_short_local_and_btc4h_rr_2_5_strict",
+        "F21_2h_long_btc4h_rr_2_0_strict",
+        "F22_2h_long_local_and_btc4h_rr_2_0_strict",
+        "F23_2h_short_btc4h_rr_2_0_strict",
+        "F24_2h_short_local_and_btc4h_rr_2_0_strict",
     }
     leave_one_coin_out = []
     for cfg in CONFIGS:
