@@ -96,6 +96,15 @@ CONFIGS = [
      "tol": 0.005, "window": 6, "mode": "short_market_htf", "market_htf": "4h", "rr_target": 2.0},
     {"name": "F24_2h_short_local_and_btc4h_rr_2_0_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
      "tol": 0.005, "window": 6, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 2.0},
+    # Predeclared RR=1.5 sensitivity checks; all other thresholds match the strict BTC-regime variants.
+    {"name": "F25_2h_long_btc4h_rr_1_5_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_market_htf", "market_htf": "4h", "rr_target": 1.5},
+    {"name": "F26_2h_long_local_and_btc4h_rr_1_5_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 1.5},
+    {"name": "F27_2h_short_btc4h_rr_1_5_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "short_market_htf", "market_htf": "4h", "rr_target": 1.5},
+    {"name": "F28_2h_short_local_and_btc4h_rr_1_5_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 1.5},
 ]
 
 
@@ -595,6 +604,10 @@ async def main():
         "F22_2h_long_local_and_btc4h_rr_2_0_strict",
         "F23_2h_short_btc4h_rr_2_0_strict",
         "F24_2h_short_local_and_btc4h_rr_2_0_strict",
+        "F25_2h_long_btc4h_rr_1_5_strict",
+        "F26_2h_long_local_and_btc4h_rr_1_5_strict",
+        "F27_2h_short_btc4h_rr_1_5_strict",
+        "F28_2h_short_local_and_btc4h_rr_1_5_strict",
     }
     folds = [(0.20, 0.36), (0.36, 0.52), (0.52, 0.68), (0.68, 0.84), (0.84, 1.00)]
     for cfg in CONFIGS:
@@ -652,25 +665,25 @@ async def main():
     # Nested, chronological model-selection check. For each interval, choose a
     # predeclared candidate using only earlier walk-forward folds, then score it
     # on the next fold. This is stricter than selecting the best config after
-    # inspecting all five folds. Extra 0.10R/trade is used for ranking.
+    # inspecting all five folds. Extra 0.15R/trade is used for ranking.
     aggregate_wf = [r for r in walk_forward if "coin" not in r]
     nested_walk_forward = []
 
     def combine_stressed_fold_rows(rows):
         total_trades = sum(int(r.get("trades", 0)) for r in rows)
-        net = sum(float(r.get("net_R_after_extra_0.10R", 0.0)) for r in rows)
-        gross_win = sum(float(r.get("gross_profit_R_after_extra_0.10R", 0.0)) for r in rows)
-        gross_loss = sum(float(r.get("gross_loss_R_after_extra_0.10R", 0.0)) for r in rows)
+        net = sum(float(r.get("net_R_after_extra_0.15R", 0.0)) for r in rows)
+        gross_win = sum(float(r.get("gross_profit_R_after_extra_0.15R", 0.0)) for r in rows)
+        gross_loss = sum(float(r.get("gross_loss_R_after_extra_0.15R", 0.0)) for r in rows)
         combined_pf = (
             round(gross_win / gross_loss, 3) if gross_loss > 0
             else (999 if gross_win > 0 else 0)
         )
         return {
             "trades": total_trades,
-            "net_R_after_extra_0.10R": round(net, 3),
-            "PF_after_extra_0.10R": combined_pf,
+            "net_R_after_extra_0.15R": round(net, 3),
+            "PF_after_extra_0.15R": combined_pf,
             "max_fold_drawdown_R": round(max(
-                (float(r.get("max_drawdown_R_after_extra_0.10R", 0.0)) for r in rows), default=0.0
+                (float(r.get("max_drawdown_R_after_extra_0.15R", 0.0)) for r in rows), default=0.0
             ), 3),
         }
 
@@ -703,20 +716,20 @@ async def main():
                 prior_by_fold = {int(r["fold"]): r for r in prior_rows}
                 # Avoid selecting on one aggregate winner: every prior fold must
                 # have at least 10 completed trades and remain profitable after
-                # +0.10R/trade stress. This is deliberately conservative.
+                # +0.15R/trade stress. This is deliberately conservative.
                 if any(
                     fold not in prior_by_fold
                     or int(prior_by_fold[fold].get("trades", 0)) < 10
-                    or float(prior_by_fold[fold].get("net_R_after_extra_0.10R", 0.0)) <= 0
-                    or float(prior_by_fold[fold].get("PF_after_extra_0.10R", 0.0)) <= 1.0
+                    or float(prior_by_fold[fold].get("net_R_after_extra_0.15R", 0.0)) <= 0
+                    or float(prior_by_fold[fold].get("PF_after_extra_0.15R", 0.0)) <= 1.0
                     for fold in prior_folds
                 ):
                     continue
                 train_stats = combine_stressed_fold_rows(prior_rows)
                 if (
                     train_stats["trades"] >= 30
-                    and train_stats["net_R_after_extra_0.10R"] > 0
-                    and train_stats["PF_after_extra_0.10R"] > 1.0
+                    and train_stats["net_R_after_extra_0.15R"] > 0
+                    and train_stats["PF_after_extra_0.15R"] > 1.0
                 ):
                     ranked.append((train_stats, cfg))
             if not ranked:
@@ -731,8 +744,8 @@ async def main():
             train_stats, selected_cfg = max(
                 ranked,
                 key=lambda item: (
-                    item[0]["net_R_after_extra_0.10R"],
-                    item[0]["PF_after_extra_0.10R"],
+                    item[0]["net_R_after_extra_0.15R"],
+                    item[0]["PF_after_extra_0.15R"],
                     -item[0]["max_fold_drawdown_R"],
                 ),
             )
@@ -756,8 +769,8 @@ async def main():
                 "selection_folds": prior_folds,
                 "selected_config": selected_cfg["name"],
                 "selection_trades": train_stats["trades"],
-                "selection_net_R_after_extra_0.10R": train_stats["net_R_after_extra_0.10R"],
-                "selection_PF_after_extra_0.10R": train_stats["PF_after_extra_0.10R"],
+                "selection_net_R_after_extra_0.15R": train_stats["net_R_after_extra_0.15R"],
+                "selection_PF_after_extra_0.15R": train_stats["PF_after_extra_0.15R"],
                 "test_trades": test_row["trades"],
                 "test_win_rate_pct": test_row["win_rate_pct"],
                 "test_profit_factor": test_row["profit_factor"],
@@ -766,6 +779,8 @@ async def main():
                 "test_PF_after_extra_0.05R": test_row["PF_after_extra_0.05R"],
                 "test_net_R_after_extra_0.10R": test_row["net_R_after_extra_0.10R"],
                 "test_PF_after_extra_0.10R": test_row["PF_after_extra_0.10R"],
+                "test_net_R_after_extra_0.15R": test_row["net_R_after_extra_0.15R"],
+                "test_PF_after_extra_0.15R": test_row["PF_after_extra_0.15R"],
                 "test_max_drawdown_R": test_row["max_drawdown_R"],
                 "status": "evaluated",
             })
@@ -794,6 +809,10 @@ async def main():
         "F22_2h_long_local_and_btc4h_rr_2_0_strict",
         "F23_2h_short_btc4h_rr_2_0_strict",
         "F24_2h_short_local_and_btc4h_rr_2_0_strict",
+        "F25_2h_long_btc4h_rr_1_5_strict",
+        "F26_2h_long_local_and_btc4h_rr_1_5_strict",
+        "F27_2h_short_btc4h_rr_1_5_strict",
+        "F28_2h_short_local_and_btc4h_rr_1_5_strict",
     }
     leave_one_coin_out = []
     for cfg in CONFIGS:
@@ -855,7 +874,7 @@ async def main():
         "summary": summaries, "cost_stress": cost_stress,
         "walk_forward": walk_forward, "nested_walk_forward": nested_walk_forward,
         "leave_one_coin_out": leave_one_coin_out, "per_coin": all_rows, "errors": errors,
-        "warning": "Research only. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.10R/trade stress using trade-level gross profit/loss aggregation. Additional +0.15R stress and leave-one-coin-out checks are included. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
+        "warning": "Research only. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.15R/trade stress using trade-level gross profit/loss aggregation. Additional +0.15R stress and leave-one-coin-out checks are included. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
     }
     (OUT / "summary.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({"summary": summaries, "errors": errors}, indent=2))
