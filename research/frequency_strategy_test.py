@@ -78,10 +78,15 @@ CONFIGS = [
      "tol": 0.006, "window": 8, "mode": "long_dual_htf", "htf": "4h", "rr_target": 2.5},
     {"name": "F16_2h_short_confirmed_by_4h_rr_2_5", "interval": "2h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "short_htf", "htf": "4h", "rr_target": 2.5},
+    # Cross-market regime hypotheses: require BTC's last closed 4h regime to align.
+    {"name": "F17_2h_long_btc4h_rr_2_5_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_market_htf", "market_htf": "4h", "rr_target": 2.5},
+    {"name": "F18_2h_short_btc4h_rr_2_5_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "short_market_htf", "market_htf": "4h", "rr_target": 2.5},
 ]
 
 
-def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_idx=None):
+def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_idx=None, market_regimes=None):
     """Simulate only entries and exits inside [start_idx, end_idx).
 
     Earlier candles are available only for causal indicator/pivot warm-up. The
@@ -103,6 +108,7 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
         triggered = None
         regime = regimes[i] if regimes is not None else bot.classify_regime(candles, i)
         htf_regime = htf_regimes[i] if htf_regimes is not None else None
+        market_regime = market_regimes[i] if market_regimes is not None else "UNKNOWN"
         for p in pending:
             # Filter direction/regime before selecting a retest. Otherwise an
             # ineligible pending setup can mask an eligible setup on the same candle.
@@ -113,6 +119,10 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
             if cfg["mode"] == "long_htf" and (p["dir"] != "LONG" or htf_regime != "TREND_UP"):
                 continue
             if cfg["mode"] == "short_htf" and (p["dir"] != "SHORT" or htf_regime != "TREND_DOWN"):
+                continue
+            if cfg["mode"] == "long_market_htf" and (p["dir"] != "LONG" or market_regime != "TREND_UP"):
+                continue
+            if cfg["mode"] == "short_market_htf" and (p["dir"] != "SHORT" or market_regime != "TREND_DOWN"):
                 continue
             if cfg["mode"] == "long_dual_htf" and (
                 p["dir"] != "LONG" or regime != "TREND_UP" or htf_regime != "TREND_UP"
@@ -363,12 +373,14 @@ async def main():
     errors, results, all_rows = [], [], []
     regimes_cache = {}
     htf_cache = {}
+    market_regimes_cache = {}
     trades_cache = {}
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         cache = {}
         intervals_needed = sorted(
             {cfg["interval"] for cfg in CONFIGS}
             | {cfg["htf"] for cfg in CONFIGS if cfg.get("htf")}
+            | {cfg["market_htf"] for cfg in CONFIGS if cfg.get("market_htf")}
         )
         interval_ms_map = {"1h": 3600000, "2h": 7200000, "4h": 14400000}
         # Preload all histories first so every coin in an interval uses the same
@@ -447,16 +459,40 @@ async def main():
                             hi = bisect.bisect_right(high_times, cutoff) - 1
                             htf_regimes.append(high_regimes[hi] if hi >= 0 else "UNKNOWN")
                         htf_cache[regime_key] = htf_regimes
+                    market_regimes = None
+                    if cfg.get("market_htf"):
+                        market_key = (coin, interval, cfg["market_htf"])
+                        if market_key not in market_regimes_cache:
+                            benchmark_key = ("BTC", cfg["market_htf"])
+                            benchmark_candles = cache.get(benchmark_key, [])
+                            if benchmark_candles:
+                                if benchmark_key not in regimes_cache:
+                                    regimes_cache[benchmark_key] = validated_fast_regimes(benchmark_candles)
+                                benchmark_regimes = regimes_cache[benchmark_key]
+                                benchmark_times = [c["t"] for c in benchmark_candles]
+                                lower_ms = interval_ms_map[interval]
+                                higher_ms = interval_ms_map[cfg["market_htf"]]
+                                aligned = []
+                                for candle in candles:
+                                    cutoff = candle["t"] + lower_ms - higher_ms
+                                    hi = bisect.bisect_right(benchmark_times, cutoff) - 1
+                                    aligned.append(benchmark_regimes[hi] if hi >= 0 else "UNKNOWN")
+                                market_regimes_cache[market_key] = aligned
+                            else:
+                                errors.append({"coin": "BTC", "interval": cfg["market_htf"],
+                                               "error": "BTC benchmark history unavailable"})
+                                market_regimes_cache[market_key] = ["UNKNOWN"] * len(candles)
+                        market_regimes = market_regimes_cache[market_key]
                     # Train and holdout are independent evaluation windows. Historical
                     # candles remain available for causal indicator/pivot warm-up, but
                     # pending setups and open positions do not cross the boundary.
                     train_trades = run_window(
                         candles, cfg, regimes, htf_regimes,
-                        start_idx=evaluation_start_idx, end_idx=split
+                        start_idx=evaluation_start_idx, end_idx=split, market_regimes=market_regimes
                     )
                     test_trades = run_window(
                         candles, cfg, regimes, htf_regimes,
-                        start_idx=split, end_idx=evaluation_end_idx
+                        start_idx=split, end_idx=evaluation_end_idx, market_regimes=market_regimes
                     )
                     trades_cache[(cfg["name"], coin, "train")] = train_trades
                     trades_cache[(cfg["name"], coin, "holdout")] = test_trades
@@ -530,6 +566,8 @@ async def main():
         "F14_2h_long_confirmed_by_4h_rr_2_5_strict",
         "F15_2h_long_dual_htf_rr_2_5",
         "F16_2h_short_confirmed_by_4h_rr_2_5",
+        "F17_2h_long_btc4h_rr_2_5_strict",
+        "F18_2h_short_btc4h_rr_2_5_strict",
     }
     folds = [(0.20, 0.36), (0.36, 0.52), (0.52, 0.68), (0.68, 0.84), (0.84, 1.00)]
     for cfg in CONFIGS:
@@ -557,9 +595,13 @@ async def main():
                 regime_key = (coin, cfg["interval"])
                 regimes = regimes_cache[regime_key]
                 htf_regimes = htf_cache.get(regime_key)
+                market_regimes = (
+                    market_regimes_cache.get((coin, cfg["interval"], cfg["market_htf"]))
+                    if cfg.get("market_htf") else None
+                )
                 selected = run_window(
                     candles, cfg, regimes, htf_regimes,
-                    start_idx=start_idx, end_idx=end_idx,
+                    start_idx=start_idx, end_idx=end_idx, market_regimes=market_regimes,
                 )
                 fold_trades.extend(selected)
                 days = max(1, (fold_end_utc - fold_start_utc) / 86400000)
@@ -717,6 +759,8 @@ async def main():
         "F14_2h_long_confirmed_by_4h_rr_2_5_strict",
         "F15_2h_long_dual_htf_rr_2_5",
         "F16_2h_short_confirmed_by_4h_rr_2_5",
+        "F17_2h_long_btc4h_rr_2_5_strict",
+        "F18_2h_short_btc4h_rr_2_5_strict",
     }
     leave_one_coin_out = []
     for cfg in CONFIGS:
