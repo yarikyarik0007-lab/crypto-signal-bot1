@@ -71,6 +71,13 @@ CONFIGS = [
      "tol": 0.005, "window": 6, "mode": "long_dual_htf", "htf": "4h"},
     {"name": "F13_2h_short_dual_htf_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
      "tol": 0.005, "window": 6, "mode": "short_dual_htf", "htf": "4h"},
+    # Predeclared sensitivity checks for the 2h high-RR LONG and 4h-confirmed SHORT.
+    {"name": "F14_2h_long_confirmed_by_4h_rr_2_5_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_htf", "htf": "4h", "rr_target": 2.5},
+    {"name": "F15_2h_long_dual_htf_rr_2_5", "interval": "2h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "long_dual_htf", "htf": "4h", "rr_target": 2.5},
+    {"name": "F16_2h_short_confirmed_by_4h_rr_2_5", "interval": "2h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short_htf", "htf": "4h", "rr_target": 2.5},
 ]
 
 
@@ -520,6 +527,9 @@ async def main():
         "F11_2h_short_confirmed_by_local_and_4h",
         "F12_2h_long_dual_htf_strict",
         "F13_2h_short_dual_htf_strict",
+        "F14_2h_long_confirmed_by_4h_rr_2_5_strict",
+        "F15_2h_long_dual_htf_rr_2_5",
+        "F16_2h_short_confirmed_by_4h_rr_2_5",
     }
     folds = [(0.20, 0.36), (0.36, 0.52), (0.52, 0.68), (0.68, 0.84), (0.84, 1.00)]
     for cfg in CONFIGS:
@@ -606,7 +616,14 @@ async def main():
         })
         for test_fold in interval_folds:
             prior_folds = [fold for fold in interval_folds if fold < test_fold]
-            if not prior_folds:
+            if len(prior_folds) < 2:
+                nested_walk_forward.append({
+                    "interval": interval,
+                    "test_fold": test_fold,
+                    "selection_folds": prior_folds,
+                    "selected_config": None,
+                    "status": "insufficient prior folds; require at least 2",
+                })
                 continue
             ranked = []
             for cfg in candidates:
@@ -614,6 +631,18 @@ async def main():
                     r for r in aggregate_wf
                     if r["config"] == cfg["name"] and int(r["fold"]) in prior_folds
                 ]
+                prior_by_fold = {int(r["fold"]): r for r in prior_rows}
+                # Avoid selecting on one aggregate winner: every prior fold must
+                # have at least 10 completed trades and remain profitable after
+                # +0.10R/trade stress. This is deliberately conservative.
+                if any(
+                    fold not in prior_by_fold
+                    or int(prior_by_fold[fold].get("trades", 0)) < 10
+                    or float(prior_by_fold[fold].get("net_R_after_extra_0.10R", 0.0)) <= 0
+                    or float(prior_by_fold[fold].get("PF_after_extra_0.10R", 0.0)) <= 1.0
+                    for fold in prior_folds
+                ):
+                    continue
                 train_stats = combine_stressed_fold_rows(prior_rows)
                 if (
                     train_stats["trades"] >= 30
@@ -685,6 +714,9 @@ async def main():
         "F11_2h_short_confirmed_by_local_and_4h",
         "F12_2h_long_dual_htf_strict",
         "F13_2h_short_dual_htf_strict",
+        "F14_2h_long_confirmed_by_4h_rr_2_5_strict",
+        "F15_2h_long_dual_htf_rr_2_5",
+        "F16_2h_short_confirmed_by_4h_rr_2_5",
     }
     leave_one_coin_out = []
     for cfg in CONFIGS:
