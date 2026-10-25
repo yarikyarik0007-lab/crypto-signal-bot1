@@ -83,6 +83,10 @@ CONFIGS = [
      "tol": 0.005, "window": 6, "mode": "long_market_htf", "market_htf": "4h", "rr_target": 2.5},
     {"name": "F18_2h_short_btc4h_rr_2_5_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
      "tol": 0.005, "window": 6, "mode": "short_market_htf", "market_htf": "4h", "rr_target": 2.5},
+    {"name": "F19_2h_long_local_and_btc4h_rr_2_5_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 2.5},
+    {"name": "F20_2h_short_local_and_btc4h_rr_2_5_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 2.5},
 ]
 
 
@@ -123,6 +127,14 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
             if cfg["mode"] == "long_market_htf" and (p["dir"] != "LONG" or market_regime != "TREND_UP"):
                 continue
             if cfg["mode"] == "short_market_htf" and (p["dir"] != "SHORT" or market_regime != "TREND_DOWN"):
+                continue
+            if cfg["mode"] == "long_dual_market_htf" and (
+                p["dir"] != "LONG" or regime != "TREND_UP" or market_regime != "TREND_UP"
+            ):
+                continue
+            if cfg["mode"] == "short_dual_market_htf" and (
+                p["dir"] != "SHORT" or regime != "TREND_DOWN" or market_regime != "TREND_DOWN"
+            ):
                 continue
             if cfg["mode"] == "long_dual_htf" and (
                 p["dir"] != "LONG" or regime != "TREND_UP" or htf_regime != "TREND_UP"
@@ -568,6 +580,8 @@ async def main():
         "F16_2h_short_confirmed_by_4h_rr_2_5",
         "F17_2h_long_btc4h_rr_2_5_strict",
         "F18_2h_short_btc4h_rr_2_5_strict",
+        "F19_2h_long_local_and_btc4h_rr_2_5_strict",
+        "F20_2h_short_local_and_btc4h_rr_2_5_strict",
     }
     folds = [(0.20, 0.36), (0.36, 0.52), (0.52, 0.68), (0.68, 0.84), (0.84, 1.00)]
     for cfg in CONFIGS:
@@ -761,6 +775,8 @@ async def main():
         "F16_2h_short_confirmed_by_4h_rr_2_5",
         "F17_2h_long_btc4h_rr_2_5_strict",
         "F18_2h_short_btc4h_rr_2_5_strict",
+        "F19_2h_long_local_and_btc4h_rr_2_5_strict",
+        "F20_2h_short_local_and_btc4h_rr_2_5_strict",
     }
     leave_one_coin_out = []
     for cfg in CONFIGS:
