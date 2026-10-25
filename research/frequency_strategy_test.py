@@ -495,7 +495,7 @@ async def main():
             summary = {"config": cfg["name"], "period": period,
                        **metrics(trades, days)}
             summaries.append(summary)
-            for extra_cost_r in (0.05, 0.10):
+            for extra_cost_r in (0.05, 0.10, 0.15):
                 cost_stress.append({
                     "config": cfg["name"], "period": period,
                     "extra_cost_R_per_trade": extra_cost_r,
