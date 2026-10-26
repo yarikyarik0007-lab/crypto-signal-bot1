@@ -12,10 +12,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import aiohttp
 import bot
 
-COINS = list(bot.COINS)
+_EXCLUDED_COINS = {coin.strip().upper() for coin in os.getenv("BT_EXCLUDE_COINS", "").split(",") if coin.strip()}
+COINS = [coin for coin in list(bot.COINS) if coin.upper() not in _EXCLUDED_COINS]
+if not COINS:
+    raise RuntimeError("BT_EXCLUDE_COINS removed every coin from the research universe")
 TARGET = int(os.getenv("BT_CANDLES", "4000"))
 TRAIN_FRACTION = 0.70
-OUT = Path("frequency-results")
+OUT = Path(os.getenv("BT_OUT_DIR", "frequency-results"))
 OUT.mkdir(exist_ok=True)
 
 CONFIGS = [
@@ -870,6 +873,8 @@ async def main():
         }
     report = {
         "purpose": "Compare signal frequency and trade quality on closed candles; research only.",
+        "coin_universe": COINS,
+        "excluded_coins": sorted(_EXCLUDED_COINS),
         "configs": CONFIGS, "calendar_windows": calendar_windows,
         "summary": summaries, "cost_stress": cost_stress,
         "walk_forward": walk_forward, "nested_walk_forward": nested_walk_forward,
