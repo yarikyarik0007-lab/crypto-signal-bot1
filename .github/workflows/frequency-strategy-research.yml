@@ -34,10 +34,23 @@ jobs:
         run: python research/frequency_strategy_test.py
         env:
           BT_CANDLES: '5000'
-      - name: Upload frequency results
+      - name: Upload 11-coin frequency results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: frequency-strategy-results
           path: frequency-results/
+          if-no-files-found: warn
+      - name: Run 10-coin sensitivity without ZEC
+        run: python research/frequency_strategy_test.py
+        env:
+          BT_CANDLES: '5000'
+          BT_EXCLUDE_COINS: 'ZEC'
+          BT_OUT_DIR: 'frequency-results-no-zec'
+      - name: Upload 10-coin sensitivity results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frequency-strategy-results-no-zec
+          path: frequency-results-no-zec/
           if-no-files-found: warn
