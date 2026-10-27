@@ -444,6 +444,56 @@ async def main():
                 continue
             interval_bounds[interval] = (common_start, evaluation_start, common_end)
 
+        # Optional apples-to-apples sensitivity: reuse evaluation dates from the
+        # 11-coin reference run when rerunning the 10-coin universe without ZEC.
+        # This isolates universe composition from the longer history unlocked by
+        # removing ZEC. A separate unanchored run measures the longer-history effect.
+        bounds_reference = os.getenv("BT_BOUNDS_REFERENCE")
+        if bounds_reference:
+            reference_path = Path(bounds_reference)
+            try:
+                reference_windows = json.loads(reference_path.read_text()).get("calendar_windows", {})
+            except Exception as exc:
+                reference_windows = {}
+                errors.append({
+                    "bounds_reference": bounds_reference,
+                    "error": f"could not read reference calendar windows: {exc}",
+                })
+            for interval, (common_start, _, _) in list(interval_bounds.items()):
+                reference = reference_windows.get(interval)
+                if not reference:
+                    errors.append({
+                        "interval": interval,
+                        "error": "reference run is missing calendar bounds for interval",
+                        "bounds_reference": bounds_reference,
+                    })
+                    continue
+                reference_start = int(reference["evaluation_start_utc"])
+                reference_end = int(reference["evaluation_end_utc"])
+                histories = [cache.get((coin, interval), []) for coin in COINS]
+                uncovered = [
+                    coin for coin, history in zip(COINS, histories)
+                    if not history or history[0]["t"] > reference_start or history[-1]["t"] < reference_end
+                ]
+                if uncovered:
+                    errors.append({
+                        "interval": interval,
+                        "error": "one or more histories do not cover the reference evaluation window",
+                        "coins": uncovered,
+                        "reference_start_utc": reference_start,
+                        "reference_end_utc": reference_end,
+                    })
+                    continue
+                if reference_end <= reference_start:
+                    errors.append({
+                        "interval": interval,
+                        "error": "invalid reference calendar bounds",
+                        "reference_start_utc": reference_start,
+                        "reference_end_utc": reference_end,
+                    })
+                    continue
+                interval_bounds[interval] = (common_start, reference_start, reference_end)
+
         for cfg in CONFIGS:
             interval = cfg["interval"]
             for coin in COINS:
@@ -875,11 +925,12 @@ async def main():
         "purpose": "Compare signal frequency and trade quality on closed candles; research only.",
         "coin_universe": COINS,
         "excluded_coins": sorted(_EXCLUDED_COINS),
+        "calendar_bounds_reference": os.getenv("BT_BOUNDS_REFERENCE"),
         "configs": CONFIGS, "calendar_windows": calendar_windows,
         "summary": summaries, "cost_stress": cost_stress,
         "walk_forward": walk_forward, "nested_walk_forward": nested_walk_forward,
         "leave_one_coin_out": leave_one_coin_out, "per_coin": all_rows, "errors": errors,
-        "warning": "Research only. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.15R/trade stress using trade-level gross profit/loss aggregation. Additional +0.15R stress and leave-one-coin-out checks are included. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
+        "warning": "Research only. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. When BT_BOUNDS_REFERENCE is set, evaluation_start and evaluation_end are anchored to that reference run for an apples-to-apples universe comparison; an unanchored no-ZEC run separately measures the longer-history effect. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.15R/trade stress using trade-level gross profit/loss aggregation. Additional +0.15R stress and leave-one-coin-out checks are included. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
     }
     (OUT / "summary.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({"summary": summaries, "errors": errors}, indent=2))
