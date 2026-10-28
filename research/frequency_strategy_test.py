@@ -30,6 +30,15 @@ CONFIGS = [
      "tol": 0.006, "window": 8, "mode": "trend_both"},
     {"name": "A4_4h_both_moderate", "interval": "4h", "margin": 0.003, "volume": 0.8,
      "tol": 0.008, "window": 12, "mode": "trend_both"},
+    # Predeclared 4h BTC-regime checks: test whether market alignment avoids the latest SHORT regime failure.
+    {"name": "G1_4h_short_confirmed_by_btc4h", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short_market_htf", "market_htf": "4h"},
+    {"name": "G2_4h_short_local_and_btc4h", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short_dual_market_htf", "market_htf": "4h"},
+    {"name": "G3_4h_long_confirmed_by_btc4h", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "long_market_htf", "market_htf": "4h"},
+    {"name": "G4_4h_long_local_and_btc4h", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "long_dual_market_htf", "market_htf": "4h"},
     {"name": "B_1h_current_short_only", "interval": "1h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "short"},
     {"name": "B1_1h_long_only", "interval": "1h", "margin": 0.005, "volume": 1.0,
@@ -627,6 +636,10 @@ async def main():
     walk_forward = []
     shortlist = {
         "A_4h_current_short_only",
+        "G1_4h_short_confirmed_by_btc4h",
+        "G2_4h_short_local_and_btc4h",
+        "G3_4h_long_confirmed_by_btc4h",
+        "G4_4h_long_local_and_btc4h",
         "B_1h_current_short_only",
         "B1_1h_long_only",
         "C_1h_balanced_both_directions",
@@ -843,6 +856,10 @@ async def main():
     # on a single asset; all costs are applied trade-by-trade before PF/DD.
     robustness_names = {
         "A_4h_current_short_only",
+        "G1_4h_short_confirmed_by_btc4h",
+        "G2_4h_short_local_and_btc4h",
+        "G3_4h_long_confirmed_by_btc4h",
+        "G4_4h_long_local_and_btc4h",
         "F_2h_long_confirmed_by_4h",
         "F3_2h_long_confirmed_by_4h_strict",
         "F8_2h_long_confirmed_by_4h_rr_1_5",
