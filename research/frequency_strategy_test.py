@@ -262,13 +262,15 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
                 "direction": direction, "entry_i": i + 1, "exit_i": exit_i,
                 "entry_time": candles[i + 1].get("t"), "exit_time": candles[exit_i].get("t"),
                 "r": trade_r, "exit_reason": exit_reason, "regime": regime,
-                "bars_held": max(1, exit_i - (i + 1) + 1) if exit_i is not None else None,
+                "bars_held": max(1, exit_i - (i + 1) + (0 if exit_reason == "time_stop" else 1)) if exit_i is not None else None,
                 "censored": censored,
             })
             pending = []
             if censored:
                 break
-            i = exit_i + 1
+            # A time stop fills at the next bar open, so that bar can still
+            # close and form a new signal; stop/target exits resume after exit bar.
+            i = exit_i if exit_reason == "time_stop" else exit_i + 1
             continue
 
         resistance = bot.find_pivot_level(candles, i, bot.BT_ZONE_LOOKBACK, "high")
