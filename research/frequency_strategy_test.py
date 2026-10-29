@@ -39,6 +39,15 @@ CONFIGS = [
      "tol": 0.006, "window": 8, "mode": "long_market_htf", "market_htf": "4h"},
     {"name": "G4_4h_long_local_and_btc4h", "interval": "4h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "long_dual_market_htf", "market_htf": "4h"},
+    # Predeclared exit-sensitivity tests: use next-bar open for time exits, not the signal bar close.
+    {"name": "H1_4h_short_time_stop_6", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short", "max_hold_bars": 6},
+    {"name": "H2_4h_short_time_stop_12", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short", "max_hold_bars": 12},
+    {"name": "H3_4h_short_dual_btc_time_stop_6", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short_dual_market_htf", "market_htf": "4h", "max_hold_bars": 6},
+    {"name": "H4_4h_long_dual_btc_time_stop_6", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "long_dual_market_htf", "market_htf": "4h", "max_hold_bars": 6},
     {"name": "B_1h_current_short_only", "interval": "1h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "short"},
     {"name": "B1_1h_long_only", "interval": "1h", "margin": 0.005, "volume": 1.0,
@@ -225,6 +234,22 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
                 if hit_tp:
                     exit_r, exit_i, exit_reason = rr_target, k, "target"
                     break
+                max_hold_bars = cfg.get("max_hold_bars")
+                bars_held = k - (i + 1) + 1
+                if max_hold_bars and bars_held >= int(max_hold_bars):
+                    # A time-stop decision is known only after candle k closes;
+                    # execute at the next candle open. If that open lies beyond
+                    # this evaluation window, censor the trade rather than leak.
+                    next_i = k + 1
+                    if next_i < end_idx:
+                        exit_price = candles[next_i]["o"]
+                        exit_r = (
+                            (exit_price - entry) / risk
+                            if direction == "LONG"
+                            else (entry - exit_price) / risk
+                        )
+                        exit_i, exit_reason = next_i, "time_stop"
+                    break
 
             censored = exit_r is None
             if censored:
@@ -237,6 +262,7 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
                 "direction": direction, "entry_i": i + 1, "exit_i": exit_i,
                 "entry_time": candles[i + 1].get("t"), "exit_time": candles[exit_i].get("t"),
                 "r": trade_r, "exit_reason": exit_reason, "regime": regime,
+                "bars_held": max(1, exit_i - (i + 1) + 1) if exit_i is not None else None,
                 "censored": censored,
             })
             pending = []
@@ -293,6 +319,14 @@ def metrics(trades, days, extra_cost_r=0.0):
         "gross_profit_R": round(gross_wins, 6),
         "gross_loss_R": round(gross_losses, 6),
         "avg_R": round(sum(r for _, r in rs) / len(rs), 4) if rs else 0,
+        "avg_holding_bars": round(
+            sum(int(t["bars_held"]) for t, _ in rs if t.get("bars_held") is not None)
+            / max(1, sum(t.get("bars_held") is not None for t, _ in rs)), 2
+        ),
+        "max_holding_bars": max(
+            (int(t["bars_held"]) for t, _ in rs if t.get("bars_held") is not None),
+            default=0,
+        ),
         "max_drawdown_R": round(max_dd, 3),
         "signals_per_day": round(len(rs) / days, 3) if days > 0 else 0,
     }
@@ -640,6 +674,10 @@ async def main():
         "G2_4h_short_local_and_btc4h",
         "G3_4h_long_confirmed_by_btc4h",
         "G4_4h_long_local_and_btc4h",
+        "H1_4h_short_time_stop_6",
+        "H2_4h_short_time_stop_12",
+        "H3_4h_short_dual_btc_time_stop_6",
+        "H4_4h_long_dual_btc_time_stop_6",
         "B_1h_current_short_only",
         "B1_1h_long_only",
         "C_1h_balanced_both_directions",
@@ -860,6 +898,10 @@ async def main():
         "G2_4h_short_local_and_btc4h",
         "G3_4h_long_confirmed_by_btc4h",
         "G4_4h_long_local_and_btc4h",
+        "H1_4h_short_time_stop_6",
+        "H2_4h_short_time_stop_12",
+        "H3_4h_short_dual_btc_time_stop_6",
+        "H4_4h_long_dual_btc_time_stop_6",
         "F_2h_long_confirmed_by_4h",
         "F3_2h_long_confirmed_by_4h_strict",
         "F8_2h_long_confirmed_by_4h_rr_1_5",
