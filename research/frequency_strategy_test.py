@@ -48,6 +48,13 @@ CONFIGS = [
      "tol": 0.006, "window": 8, "mode": "short_dual_market_htf", "market_htf": "4h", "max_hold_bars": 6},
     {"name": "H4_4h_long_dual_btc_time_stop_6", "interval": "4h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "long_dual_market_htf", "market_htf": "4h", "max_hold_bars": 6},
+    # Predeclared cross-direction regime family: allow LONG and SHORT only when local 4h and BTC 4h agree.
+    {"name": "I1_4h_both_directions_dual_btc", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "trend_both_dual_market_htf", "market_htf": "4h"},
+    {"name": "I2_4h_both_directions_dual_btc_time_stop_6", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "trend_both_dual_market_htf", "market_htf": "4h", "max_hold_bars": 6},
+    {"name": "I3_4h_both_directions_dual_btc_time_stop_12", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "trend_both_dual_market_htf", "market_htf": "4h", "max_hold_bars": 12},
     {"name": "B_1h_current_short_only", "interval": "1h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "short"},
     {"name": "B1_1h_long_only", "interval": "1h", "margin": 0.005, "volume": 1.0,
@@ -191,6 +198,12 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
             if cfg["mode"] == "trend_both":
                 if (p["dir"] == "LONG" and regime != "TREND_UP") or (
                     p["dir"] == "SHORT" and regime != "TREND_DOWN"
+                ):
+                    continue
+            if cfg["mode"] == "trend_both_dual_market_htf":
+                if (
+                    (p["dir"] == "LONG" and (regime != "TREND_UP" or market_regime != "TREND_UP"))
+                    or (p["dir"] == "SHORT" and (regime != "TREND_DOWN" or market_regime != "TREND_DOWN"))
                 ):
                     continue
             if p["dir"] == "LONG":
@@ -680,6 +693,9 @@ async def main():
         "H2_4h_short_time_stop_12",
         "H3_4h_short_dual_btc_time_stop_6",
         "H4_4h_long_dual_btc_time_stop_6",
+        "I1_4h_both_directions_dual_btc",
+        "I2_4h_both_directions_dual_btc_time_stop_6",
+        "I3_4h_both_directions_dual_btc_time_stop_12",
         "B_1h_current_short_only",
         "B1_1h_long_only",
         "C_1h_balanced_both_directions",
@@ -904,6 +920,9 @@ async def main():
         "H2_4h_short_time_stop_12",
         "H3_4h_short_dual_btc_time_stop_6",
         "H4_4h_long_dual_btc_time_stop_6",
+        "I1_4h_both_directions_dual_btc",
+        "I2_4h_both_directions_dual_btc_time_stop_6",
+        "I3_4h_both_directions_dual_btc_time_stop_12",
         "F_2h_long_confirmed_by_4h",
         "F3_2h_long_confirmed_by_4h_strict",
         "F8_2h_long_confirmed_by_4h_rr_1_5",
