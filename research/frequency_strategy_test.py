@@ -55,6 +55,19 @@ CONFIGS = [
      "tol": 0.006, "window": 8, "mode": "trend_both_dual_market_htf", "market_htf": "4h", "max_hold_bars": 6},
     {"name": "I3_4h_both_directions_dual_btc_time_stop_12", "interval": "4h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "trend_both_dual_market_htf", "market_htf": "4h", "max_hold_bars": 12},
+    # Predeclared regime-invalidation exits: decide at candle close, fill at next candle open.
+    {"name": "J1_4h_short_btc_regime_flip_exit", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short_market_htf", "market_htf": "4h",
+     "exit_on_market_regime_flip": True},
+    {"name": "J2_4h_short_dual_regime_flip_exit", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short_dual_market_htf", "market_htf": "4h",
+     "exit_on_local_regime_flip": True, "exit_on_market_regime_flip": True},
+    {"name": "J3_4h_long_dual_regime_flip_exit", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "long_dual_market_htf", "market_htf": "4h",
+     "exit_on_local_regime_flip": True, "exit_on_market_regime_flip": True},
+    {"name": "J4_4h_both_dual_regime_flip_exit", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "trend_both_dual_market_htf", "market_htf": "4h",
+     "exit_on_local_regime_flip": True, "exit_on_market_regime_flip": True},
     {"name": "B_1h_current_short_only", "interval": "1h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "short"},
     {"name": "B1_1h_long_only", "interval": "1h", "margin": 0.005, "volume": 1.0,
@@ -247,6 +260,30 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
                 if hit_tp:
                     exit_r, exit_i, exit_reason = rr_target, k, "target"
                     break
+                # Optional causal regime-invalidation exit. The regime is known
+                # only after candle k closes, so execution is at candle k+1 open.
+                expected_regime = "TREND_UP" if direction == "LONG" else "TREND_DOWN"
+                regime_flipped = (
+                    cfg.get("exit_on_local_regime_flip")
+                    and regimes is not None
+                    and regimes[k] != expected_regime
+                )
+                market_regime_flipped = (
+                    cfg.get("exit_on_market_regime_flip")
+                    and market_regimes is not None
+                    and market_regimes[k] != expected_regime
+                )
+                if regime_flipped or market_regime_flipped:
+                    next_i = k + 1
+                    if next_i < end_idx:
+                        exit_price = candles[next_i]["o"]
+                        exit_r = (
+                            (exit_price - entry) / risk
+                            if direction == "LONG"
+                            else (entry - exit_price) / risk
+                        )
+                        exit_i, exit_reason = next_i, "regime_flip"
+                    break
                 max_hold_bars = cfg.get("max_hold_bars")
                 bars_held = k - (i + 1) + 1
                 if max_hold_bars and bars_held >= int(max_hold_bars):
@@ -275,15 +312,15 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
                 "direction": direction, "entry_i": i + 1, "exit_i": exit_i,
                 "entry_time": candles[i + 1].get("t"), "exit_time": candles[exit_i].get("t"),
                 "r": trade_r, "exit_reason": exit_reason, "regime": regime,
-                "bars_held": max(1, exit_i - (i + 1) + (0 if exit_reason == "time_stop" else 1)) if exit_i is not None else None,
+                "bars_held": max(1, exit_i - (i + 1) + (0 if exit_reason in {"time_stop", "regime_flip"} else 1)) if exit_i is not None else None,
                 "censored": censored,
             })
             pending = []
             if censored:
                 break
-            # A time stop fills at the next bar open, so that bar can still
-            # close and form a new signal; stop/target exits resume after exit bar.
-            i = exit_i if exit_reason == "time_stop" else exit_i + 1
+            # Time-stop and regime-flip exits fill at the next bar open, so that
+            # bar can still close and form a new signal; stop/target resume after exit bar.
+            i = exit_i if exit_reason in {"time_stop", "regime_flip"} else exit_i + 1
             continue
 
         resistance = bot.find_pivot_level(candles, i, bot.BT_ZONE_LOOKBACK, "high")
@@ -696,6 +733,10 @@ async def main():
         "I1_4h_both_directions_dual_btc",
         "I2_4h_both_directions_dual_btc_time_stop_6",
         "I3_4h_both_directions_dual_btc_time_stop_12",
+        "J1_4h_short_btc_regime_flip_exit",
+        "J2_4h_short_dual_regime_flip_exit",
+        "J3_4h_long_dual_regime_flip_exit",
+        "J4_4h_both_dual_regime_flip_exit",
         "B_1h_current_short_only",
         "B1_1h_long_only",
         "C_1h_balanced_both_directions",
