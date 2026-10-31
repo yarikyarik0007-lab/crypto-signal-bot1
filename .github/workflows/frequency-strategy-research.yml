@@ -1,0 +1,70 @@
+name: Isolated 1h strategy frequency research
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/frequency-strategy-1h-2026-10
+
+permissions:
+  contents: read
+
+# PR and push events previously launched duplicate 45-minute research jobs.
+# Keep only one active run for this branch and cancel stale runs on new commits.
+concurrency:
+  group: frequency-strategy-research-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frequency-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout isolated research branch
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile research harness
+        run: python -m py_compile bot.py research/frequency_strategy_test.py
+      - name: Run 4h baseline and 1h candidate comparisons
+        run: python research/frequency_strategy_test.py
+        env:
+          BT_CANDLES: '5000'
+      - name: Upload 11-coin frequency results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frequency-strategy-results
+          path: frequency-results/
+          if-no-files-found: warn
+      - name: Run 10-coin matched-calendar sensitivity without ZEC
+        run: python research/frequency_strategy_test.py
+        env:
+          BT_CANDLES: '5000'
+          BT_EXCLUDE_COINS: 'ZEC'
+          BT_BOUNDS_REFERENCE: 'frequency-results/summary.json'
+          BT_OUT_DIR: 'frequency-results-no-zec-matched'
+      - name: Upload 10-coin matched-calendar results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frequency-strategy-results-no-zec-matched
+          path: frequency-results-no-zec-matched/
+          if-no-files-found: warn
+      - name: Run 10-coin extended-history sensitivity without ZEC
+        run: python research/frequency_strategy_test.py
+        env:
+          BT_CANDLES: '5000'
+          BT_EXCLUDE_COINS: 'ZEC'
+          BT_OUT_DIR: 'frequency-results-no-zec-extended'
+      - name: Upload 10-coin extended-history results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frequency-strategy-results-no-zec-extended
+          path: frequency-results-no-zec-extended/
+          if-no-files-found: warn
