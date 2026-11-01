@@ -68,6 +68,18 @@ CONFIGS = [
     {"name": "J4_4h_both_dual_regime_flip_exit", "interval": "4h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "trend_both_dual_market_htf", "market_htf": "4h",
      "exit_on_local_regime_flip": True, "exit_on_market_regime_flip": True},
+    # Predeclared breakeven sensitivity. Activation is based on candle CLOSE and applies
+    # from the next candle, avoiding optimistic intrabar ordering assumptions.
+    {"name": "K1_4h_short_breakeven_after_1R", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short", "breakeven_after_R": 1.0},
+    {"name": "K2_4h_short_breakeven_after_0_75R", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short", "breakeven_after_R": 0.75},
+    {"name": "K3_2h_long_rr_2_5_breakeven_after_1R", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_htf", "htf": "4h", "rr_target": 2.5,
+     "breakeven_after_R": 1.0},
+    {"name": "K4_2h_long_rr_2_5_breakeven_after_0_75R", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_htf", "htf": "4h", "rr_target": 2.5,
+     "breakeven_after_R": 0.75},
     {"name": "B_1h_current_short_only", "interval": "1h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "short"},
     {"name": "B1_1h_long_only", "interval": "1h", "margin": 0.005, "volume": 1.0,
@@ -246,20 +258,41 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
                 continue
 
             exit_r, exit_i, exit_reason = None, None, None
+            breakeven_after_r = cfg.get("breakeven_after_R")
+            breakeven_active = False
             # Crucially, never inspect candles beyond this evaluation window.
             for k in range(i + 1, end_idx):
                 c = candles[k]
+                active_sl = entry if breakeven_active else sl
                 if direction == "LONG":
-                    hit_sl, hit_tp = c["l"] <= sl, c["h"] >= tp
+                    hit_sl, hit_tp = c["l"] <= active_sl, c["h"] >= tp
                 else:
-                    hit_sl, hit_tp = c["h"] >= sl, c["l"] <= tp
-                # Conservative tie-break: if both hit in one candle, assume stop first.
+                    hit_sl, hit_tp = c["h"] >= active_sl, c["l"] <= tp
+                # Conservative tie-break: if stop and target hit in one candle,
+                # assume the active stop was hit first.
                 if hit_sl:
-                    exit_r, exit_i, exit_reason = -1.0, k, "stop"
+                    exit_r = 0.0 if breakeven_active else -1.0
+                    exit_i = k
+                    exit_reason = "breakeven" if breakeven_active else "stop"
                     break
                 if hit_tp:
                     exit_r, exit_i, exit_reason = rr_target, k, "target"
                     break
+                # Arm breakeven only after a completed candle closes beyond the
+                # predeclared threshold. The entry-price stop becomes active on
+                # the next candle; no same-candle high/low sequencing is assumed.
+                if breakeven_after_r and not breakeven_active:
+                    threshold = (
+                        entry + float(breakeven_after_r) * risk
+                        if direction == "LONG"
+                        else entry - float(breakeven_after_r) * risk
+                    )
+                    reached_threshold = (
+                        c["c"] >= threshold if direction == "LONG"
+                        else c["c"] <= threshold
+                    )
+                    if reached_threshold:
+                        breakeven_active = True
                 # Optional causal regime-invalidation exit. The regime is known
                 # only after candle k closes, so execution is at candle k+1 open.
                 expected_regime = "TREND_UP" if direction == "LONG" else "TREND_DOWN"
@@ -737,6 +770,10 @@ async def main():
         "J2_4h_short_dual_regime_flip_exit",
         "J3_4h_long_dual_regime_flip_exit",
         "J4_4h_both_dual_regime_flip_exit",
+        "K1_4h_short_breakeven_after_1R",
+        "K2_4h_short_breakeven_after_0_75R",
+        "K3_2h_long_rr_2_5_breakeven_after_1R",
+        "K4_2h_long_rr_2_5_breakeven_after_0_75R",
         "B_1h_current_short_only",
         "B1_1h_long_only",
         "C_1h_balanced_both_directions",
@@ -824,6 +861,54 @@ async def main():
             }
             walk_forward.append(add_cost_stress(fold_row, fold_trades, fold_days))
             walk_forward.extend(fold_coin_rows)
+
+    # Additional denser walk-forward: retain the first 20% as initial history,
+    # then evaluate seven smaller, contiguous, non-overlapping windows.
+    walk_forward_dense = []
+    dense_folds = [
+        (0.20 + 0.80 * idx / 7, 0.20 + 0.80 * (idx + 1) / 7)
+        for idx in range(7)
+    ]
+    for cfg in CONFIGS:
+        if cfg["name"] not in shortlist:
+            continue
+        bounds = interval_bounds.get(cfg["interval"])
+        if not bounds:
+            continue
+        _, evaluation_start, common_end = bounds
+        calendar_span = common_end - evaluation_start
+        for fold_no, (start_frac, end_frac) in enumerate(dense_folds, start=1):
+            fold_start_utc = int(evaluation_start + calendar_span * start_frac)
+            fold_end_utc = int(evaluation_start + calendar_span * end_frac)
+            fold_trades = []
+            for coin in COINS:
+                candles = cache.get((coin, cfg["interval"]), [])
+                if len(candles) < 500:
+                    continue
+                candle_times = [c["t"] for c in candles]
+                start_idx = bisect.bisect_left(candle_times, fold_start_utc)
+                end_idx = bisect.bisect_left(candle_times, fold_end_utc)
+                if end_idx <= start_idx + 30:
+                    continue
+                regime_key = (coin, cfg["interval"])
+                regimes = regimes_cache[regime_key]
+                htf_regimes = htf_cache.get(regime_key)
+                market_regimes = (
+                    market_regimes_cache.get((coin, cfg["interval"], cfg["market_htf"]))
+                    if cfg.get("market_htf") else None
+                )
+                fold_trades.extend(run_window(
+                    candles, cfg, regimes, htf_regimes,
+                    start_idx=start_idx, end_idx=end_idx, market_regimes=market_regimes,
+                ))
+            fold_days = max(1, (fold_end_utc - fold_start_utc) / 86400000)
+            dense_row = {
+                "config": cfg["name"], "fold": fold_no,
+                "start_fraction": round(start_frac, 6), "end_fraction": round(end_frac, 6),
+                "start_utc": fold_start_utc, "end_utc": fold_end_utc,
+                **metrics(fold_trades, fold_days),
+            }
+            walk_forward_dense.append(add_cost_stress(dense_row, fold_trades, fold_days))
 
     # Nested, chronological model-selection check. For each interval, choose a
     # predeclared candidate using only earlier walk-forward folds, then score it
@@ -948,6 +1033,99 @@ async def main():
                 "status": "evaluated",
             })
 
+    # Nested check over the seven denser folds. Require at least three prior
+    # folds, >=8 trades in every prior fold, and positive PF/net R after +0.15R
+    # stress in every prior fold before a candidate can be selected.
+    aggregate_dense_wf = walk_forward_dense
+    nested_walk_forward_dense = []
+    for interval in sorted({cfg["interval"] for cfg in CONFIGS}):
+        candidates = [
+            cfg for cfg in CONFIGS
+            if cfg["interval"] == interval and cfg["name"] in shortlist
+        ]
+        candidate_names = {cfg["name"] for cfg in candidates}
+        interval_folds = sorted({
+            int(row["fold"]) for row in aggregate_dense_wf
+            if row["config"] in candidate_names
+        })
+        for test_fold in interval_folds:
+            prior_folds = [fold for fold in interval_folds if fold < test_fold]
+            if len(prior_folds) < 3:
+                nested_walk_forward_dense.append({
+                    "interval": interval, "test_fold": test_fold,
+                    "selection_folds": prior_folds, "selected_config": None,
+                    "status": "insufficient prior folds; require at least 3",
+                })
+                continue
+            ranked = []
+            for cfg in candidates:
+                prior_rows = [
+                    row for row in aggregate_dense_wf
+                    if row["config"] == cfg["name"] and int(row["fold"]) in prior_folds
+                ]
+                by_fold = {int(row["fold"]): row for row in prior_rows}
+                if any(
+                    fold not in by_fold
+                    or int(by_fold[fold].get("trades", 0)) < 8
+                    or float(by_fold[fold].get("net_R_after_extra_0.15R", 0.0)) <= 0
+                    or float(by_fold[fold].get("PF_after_extra_0.15R", 0.0)) <= 1.0
+                    for fold in prior_folds
+                ):
+                    continue
+                stats = combine_stressed_fold_rows(prior_rows)
+                if (
+                    stats["trades"] >= 30
+                    and stats["net_R_after_extra_0.15R"] > 0
+                    and stats["PF_after_extra_0.15R"] > 1.0
+                ):
+                    ranked.append((stats, cfg))
+            if not ranked:
+                nested_walk_forward_dense.append({
+                    "interval": interval, "test_fold": test_fold,
+                    "selection_folds": prior_folds, "selected_config": None,
+                    "status": "no candidate met prior-fold minimums",
+                })
+                continue
+            train_stats, selected_cfg = max(
+                ranked,
+                key=lambda item: (
+                    item[0]["net_R_after_extra_0.15R"],
+                    item[0]["PF_after_extra_0.15R"],
+                    -item[0]["max_fold_drawdown_R"],
+                ),
+            )
+            test_rows = [
+                row for row in aggregate_dense_wf
+                if row["config"] == selected_cfg["name"] and int(row["fold"]) == test_fold
+            ]
+            if not test_rows:
+                nested_walk_forward_dense.append({
+                    "interval": interval, "test_fold": test_fold,
+                    "selection_folds": prior_folds, "selected_config": selected_cfg["name"],
+                    "status": "missing test-fold result",
+                })
+                continue
+            test_row = test_rows[0]
+            nested_walk_forward_dense.append({
+                "interval": interval, "test_fold": test_fold,
+                "selection_folds": prior_folds, "selected_config": selected_cfg["name"],
+                "selection_trades": train_stats["trades"],
+                "selection_net_R_after_extra_0.15R": train_stats["net_R_after_extra_0.15R"],
+                "selection_PF_after_extra_0.15R": train_stats["PF_after_extra_0.15R"],
+                "test_trades": test_row["trades"],
+                "test_win_rate_pct": test_row["win_rate_pct"],
+                "test_profit_factor": test_row["profit_factor"],
+                "test_net_R": test_row["net_R"],
+                "test_net_R_after_extra_0.05R": test_row["net_R_after_extra_0.05R"],
+                "test_PF_after_extra_0.05R": test_row["PF_after_extra_0.05R"],
+                "test_net_R_after_extra_0.10R": test_row["net_R_after_extra_0.10R"],
+                "test_PF_after_extra_0.10R": test_row["PF_after_extra_0.10R"],
+                "test_net_R_after_extra_0.15R": test_row["net_R_after_extra_0.15R"],
+                "test_PF_after_extra_0.15R": test_row["PF_after_extra_0.15R"],
+                "test_max_drawdown_R": test_row["max_drawdown_R"],
+                "status": "evaluated",
+            })
+
     # Leave-one-coin-out robustness for the baseline and the most informative
     # LONG/SHORT candidates. This checks whether aggregate performance depends
     # on a single asset; all costs are applied trade-by-trade before PF/DD.
@@ -964,6 +1142,10 @@ async def main():
         "I1_4h_both_directions_dual_btc",
         "I2_4h_both_directions_dual_btc_time_stop_6",
         "I3_4h_both_directions_dual_btc_time_stop_12",
+        "K1_4h_short_breakeven_after_1R",
+        "K2_4h_short_breakeven_after_0_75R",
+        "K3_2h_long_rr_2_5_breakeven_after_1R",
+        "K4_2h_long_rr_2_5_breakeven_after_0_75R",
         "F_2h_long_confirmed_by_4h",
         "F3_2h_long_confirmed_by_4h_strict",
         "F8_2h_long_confirmed_by_4h_rr_1_5",
@@ -1050,8 +1232,10 @@ async def main():
         "configs": CONFIGS, "calendar_windows": calendar_windows,
         "summary": summaries, "cost_stress": cost_stress,
         "walk_forward": walk_forward, "nested_walk_forward": nested_walk_forward,
+        "walk_forward_dense": walk_forward_dense,
+        "nested_walk_forward_dense": nested_walk_forward_dense,
         "leave_one_coin_out": leave_one_coin_out, "per_coin": all_rows, "errors": errors,
-        "warning": "Research only. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. When BT_BOUNDS_REFERENCE is set, evaluation_start and evaluation_end are anchored to that reference run for an apples-to-apples universe comparison; an unanchored no-ZEC run separately measures the longer-history effect. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.15R/trade stress using trade-level gross profit/loss aggregation. Additional +0.15R stress and leave-one-coin-out checks are included. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
+        "warning": "Research only. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. When BT_BOUNDS_REFERENCE is set, evaluation_start and evaluation_end are anchored to that reference run for an apples-to-apples universe comparison; an unanchored no-ZEC run separately measures the longer-history effect. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.15R/trade stress using trade-level gross profit/loss aggregation. An additional seven-window sequential walk-forward and nested selection require positive stressed results in every prior selection window. Break-even variants activate only after a candle close and use the next candle onward. Additional +0.15R stress and leave-one-coin-out checks are included. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
     }
     (OUT / "summary.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({"summary": summaries, "errors": errors}, indent=2))
