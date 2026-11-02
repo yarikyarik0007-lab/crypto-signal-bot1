@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import bisect
+import random
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -428,6 +429,101 @@ def add_cost_stress(row, trades, days):
         row[f"gross_profit_R_after_extra_{suffix}"] = stressed["gross_profit_R"]
         row[f"gross_loss_R_after_extra_{suffix}"] = stressed["gross_loss_R"]
     return row
+
+
+def weekly_block_bootstrap(trades, extra_cost_r, seed, n_boot=1000, block_weeks=4):
+    """Circular four-week block bootstrap over weekly portfolio returns.
+
+    Trades from all coins are pooled by exit week before resampling, preserving
+    cross-asset clustering and short-range time dependence better than IID
+    trade resampling. This is a diagnostic, not a guarantee or a formal proof
+    of stationarity.
+    """
+    completed = [
+        t for t in trades
+        if t.get("r") is not None and not t.get("censored", False)
+        and (t.get("exit_time") is not None or t.get("entry_time") is not None)
+    ]
+    if len(completed) < 20:
+        return {
+            "completed_trades": len(completed), "weeks": 0,
+            "observed_net_R": None, "observed_mean_R_per_trade": None,
+            "mean_R_ci95_low": None, "mean_R_ci95_high": None,
+            "bootstrap_probability_mean_R_positive": None,
+            "net_R_ci95_low": None, "net_R_ci95_high": None,
+            "bootstrap_probability_net_R_positive": None,
+            "status": "fewer than 20 completed trades",
+        }
+
+    week_ms = 7 * 24 * 60 * 60 * 1000
+    weekly = {}
+    for trade in completed:
+        timestamp = trade.get("exit_time") or trade.get("entry_time")
+        week = int(timestamp // week_ms)
+        weekly.setdefault(week, []).append(float(trade["r"]))
+
+    first_week, last_week = min(weekly), max(weekly)
+    series = []
+    for week in range(first_week, last_week + 1):
+        rs = weekly.get(week, [])
+        series.append((sum(rs) - extra_cost_r * len(rs), len(rs)))
+
+    observed_count = sum(count for _, count in series)
+    observed_net = sum(net for net, _ in series)
+    if not observed_count:
+        return {
+            "completed_trades": 0, "weeks": len(series),
+            "observed_net_R": 0.0, "observed_mean_R_per_trade": None,
+            "mean_R_ci95_low": None, "mean_R_ci95_high": None,
+            "bootstrap_probability_mean_R_positive": None,
+            "net_R_ci95_low": None, "net_R_ci95_high": None,
+            "bootstrap_probability_net_R_positive": None,
+            "status": "no completed trades",
+        }
+
+    rng = random.Random(seed)
+    means, nets = [], []
+    n_weeks = len(series)
+    for _ in range(n_boot):
+        sampled_net = 0.0
+        sampled_count = 0
+        drawn = 0
+        while drawn < n_weeks:
+            start = rng.randrange(n_weeks)
+            take = min(block_weeks, n_weeks - drawn)
+            for offset in range(take):
+                net, count = series[(start + offset) % n_weeks]
+                sampled_net += net
+                sampled_count += count
+            drawn += take
+        nets.append(sampled_net)
+        if sampled_count:
+            means.append(sampled_net / sampled_count)
+
+    means.sort()
+    nets.sort()
+    def percentile(values, p):
+        if not values:
+            return None
+        position = (len(values) - 1) * p
+        lower = int(position)
+        upper = min(lower + 1, len(values) - 1)
+        weight = position - lower
+        return values[lower] * (1 - weight) + values[upper] * weight
+
+    return {
+        "completed_trades": observed_count,
+        "weeks": n_weeks,
+        "observed_net_R": round(observed_net, 3),
+        "observed_mean_R_per_trade": round(observed_net / observed_count, 5),
+        "mean_R_ci95_low": round(percentile(means, 0.025), 5) if means else None,
+        "mean_R_ci95_high": round(percentile(means, 0.975), 5) if means else None,
+        "bootstrap_probability_mean_R_positive": round(sum(x > 0 for x in means) / len(means), 4) if means else None,
+        "net_R_ci95_low": round(percentile(nets, 0.025), 3),
+        "net_R_ci95_high": round(percentile(nets, 0.975), 3),
+        "bootstrap_probability_net_R_positive": round(sum(x > 0 for x in nets) / len(nets), 4),
+        "status": "diagnostic; weekly circular block bootstrap",
+    }
 
 
 async def load(session, coin, interval):
@@ -1210,6 +1306,46 @@ async def main():
                     "max_drawdown_R_after_extra_0.15R": stressed_015["max_drawdown_R"],
                 })
 
+    # Weekly block-bootstrap uncertainty for a fixed, predeclared shortlist.
+    # This is reported separately from candidate selection to reduce winner's-curse
+    # risk; it must not be used to tune thresholds against the holdout.
+    bootstrap_names = {
+        "A_4h_current_short_only",
+        "G1_4h_short_confirmed_by_btc4h",
+        "G2_4h_short_local_and_btc4h",
+        "J1_4h_short_btc_regime_flip_exit",
+        "J2_4h_short_dual_regime_flip_exit",
+        "K1_4h_short_breakeven_after_1R",
+        "K2_4h_short_breakeven_after_0_75R",
+        "K3_2h_long_rr_2_5_breakeven_after_1R",
+        "K4_2h_long_rr_2_5_breakeven_after_0_75R",
+        "F14_2h_long_confirmed_by_4h_rr_2_5_strict",
+        "F19_2h_long_local_and_btc4h_rr_2_5_strict",
+        "F20_2h_short_local_and_btc4h_rr_2_5_strict",
+    }
+    bootstrap_uncertainty = []
+    for cfg in CONFIGS:
+        if cfg["name"] not in bootstrap_names:
+            continue
+        for period in ("train", "holdout"):
+            combined_trades = []
+            for coin in COINS:
+                combined_trades.extend(trades_cache.get((cfg["name"], coin, period), []))
+            for extra_cost_r in (0.0, 0.05, 0.10, 0.15):
+                stable_seed = (
+                    sum((idx + 1) * ord(ch) for idx, ch in enumerate(cfg["name"]))
+                    + (10000 if period == "holdout" else 0)
+                    + int(extra_cost_r * 1000)
+                    + len(COINS) * 100000
+                )
+                uncertainty = weekly_block_bootstrap(
+                    combined_trades, extra_cost_r=extra_cost_r, seed=stable_seed
+                )
+                bootstrap_uncertainty.append({
+                    "config": cfg["name"], "period": period,
+                    "extra_cost_R_per_trade": extra_cost_r, **uncertainty,
+                })
+
     with (OUT / "per_coin.csv").open("w", newline="") as f:
         fields = list(all_rows[0].keys()) if all_rows else ["config", "coin", "period"]
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -1234,6 +1370,7 @@ async def main():
         "walk_forward": walk_forward, "nested_walk_forward": nested_walk_forward,
         "walk_forward_dense": walk_forward_dense,
         "nested_walk_forward_dense": nested_walk_forward_dense,
+        "bootstrap_uncertainty": bootstrap_uncertainty,
         "leave_one_coin_out": leave_one_coin_out, "per_coin": all_rows, "errors": errors,
         "warning": "Research only. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. When BT_BOUNDS_REFERENCE is set, evaluation_start and evaluation_end are anchored to that reference run for an apples-to-apples universe comparison; an unanchored no-ZEC run separately measures the longer-history effect. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.15R/trade stress using trade-level gross profit/loss aggregation. An additional seven-window sequential walk-forward and nested selection require positive stressed results in every prior selection window. Break-even variants activate only after a candle close and use the next candle onward. Additional +0.15R stress and leave-one-coin-out checks are included. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
     }
