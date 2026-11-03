@@ -1332,19 +1332,28 @@ async def main():
             for coin in COINS:
                 combined_trades.extend(trades_cache.get((cfg["name"], coin, period), []))
             for extra_cost_r in (0.0, 0.05, 0.10, 0.15):
-                stable_seed = (
-                    sum((idx + 1) * ord(ch) for idx, ch in enumerate(cfg["name"]))
-                    + (10000 if period == "holdout" else 0)
-                    + int(extra_cost_r * 1000)
-                    + len(COINS) * 100000
-                )
-                uncertainty = weekly_block_bootstrap(
-                    combined_trades, extra_cost_r=extra_cost_r, seed=stable_seed
-                )
-                bootstrap_uncertainty.append({
-                    "config": cfg["name"], "period": period,
-                    "extra_cost_R_per_trade": extra_cost_r, **uncertainty,
-                })
+                for block_weeks in (2, 4, 8):
+                    stable_seed = (
+                        sum((idx + 1) * ord(ch) for idx, ch in enumerate(cfg["name"]))
+                        + (10000 if period == "holdout" else 0)
+                        + int(extra_cost_r * 1000)
+                        + len(COINS) * 100000
+                        + block_weeks * 1000003
+                    )
+                    uncertainty = weekly_block_bootstrap(
+                        combined_trades,
+                        extra_cost_r=extra_cost_r,
+                        seed=stable_seed,
+                        n_boot=2000,
+                        block_weeks=block_weeks,
+                    )
+                    bootstrap_uncertainty.append({
+                        "config": cfg["name"], "period": period,
+                        "extra_cost_R_per_trade": extra_cost_r,
+                        "bootstrap_block_weeks": block_weeks,
+                        "bootstrap_replicates": 2000,
+                        **uncertainty,
+                    })
 
     with (OUT / "per_coin.csv").open("w", newline="") as f:
         fields = list(all_rows[0].keys()) if all_rows else ["config", "coin", "period"]
@@ -1371,6 +1380,13 @@ async def main():
         "walk_forward_dense": walk_forward_dense,
         "nested_walk_forward_dense": nested_walk_forward_dense,
         "bootstrap_uncertainty": bootstrap_uncertainty,
+        "bootstrap_method": {
+            "resampling_unit": "weekly portfolio returns pooled across coins",
+            "block_lengths_weeks": [2, 4, 8],
+            "replicates_per_block_length": 2000,
+            "confidence_level": 0.95,
+            "note": "Block-length sensitivity is diagnostic; it does not establish stationarity or future profitability.",
+        },
         "leave_one_coin_out": leave_one_coin_out, "per_coin": all_rows, "errors": errors,
         "warning": "Research only. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. When BT_BOUNDS_REFERENCE is set, evaluation_start and evaluation_end are anchored to that reference run for an apples-to-apples universe comparison; an unanchored no-ZEC run separately measures the longer-history effect. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.15R/trade stress using trade-level gross profit/loss aggregation. An additional seven-window sequential walk-forward and nested selection require positive stressed results in every prior selection window. Break-even variants activate only after a candle close and use the next candle onward. Additional +0.15R stress and leave-one-coin-out checks are included. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
     }
