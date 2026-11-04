@@ -159,6 +159,19 @@ CONFIGS = [
      "tol": 0.005, "window": 6, "mode": "short_market_htf", "market_htf": "4h", "rr_target": 1.5},
     {"name": "F28_2h_short_local_and_btc4h_rr_1_5_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
      "tol": 0.005, "window": 6, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 1.5},
+    # Predeclared 4h SHORT take-profit sensitivity: same entry rules, fixed RR 1.5 or 2.5.
+    {"name": "L1_4h_short_rr_1_5", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short", "rr_target": 1.5},
+    {"name": "L2_4h_short_rr_2_5", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short", "rr_target": 2.5},
+    {"name": "L3_4h_short_btc4h_rr_1_5", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short_market_htf", "market_htf": "4h", "rr_target": 1.5},
+    {"name": "L4_4h_short_btc4h_rr_2_5", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short_market_htf", "market_htf": "4h", "rr_target": 2.5},
+    {"name": "L5_4h_short_dual_btc_rr_1_5", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 1.5},
+    {"name": "L6_4h_short_dual_btc_rr_2_5", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 2.5},
 ]
 
 
@@ -418,9 +431,30 @@ def metrics(trades, days, extra_cost_r=0.0):
     }
 
 
+def validate_cost_stress_step(base, stressed, extra_cost_r, previous=None, context=""):
+    expected_net = round(float(base["net_R"]) - extra_cost_r * int(base["trades"]), 3)
+    if abs(float(stressed["net_R"]) - expected_net) > 0.001:
+        raise RuntimeError(
+            f"{context}: net_R stress mismatch at +{extra_cost_r:.2f}R; "
+            f"expected {expected_net}, got {stressed['net_R']}"
+        )
+    if previous is not None:
+        if float(stressed["net_R"]) > float(previous["net_R"]) + 0.001:
+            raise RuntimeError(f"{context}: net_R improved when costs increased")
+        if float(stressed["profit_factor"]) > float(previous["profit_factor"]) + 0.001:
+            raise RuntimeError(f"{context}: PF improved when costs increased")
+        if float(stressed["win_rate_pct"]) > float(previous["win_rate_pct"]) + 0.001:
+            raise RuntimeError(f"{context}: win rate improved when costs increased")
+
+
 def add_cost_stress(row, trades, days):
-    for extra_cost_r in (0.05, 0.10, 0.15):
+    previous = row
+    for extra_cost_r in (0.05, 0.10, 0.15, 0.20, 0.25):
         stressed = metrics(trades, days, extra_cost_r=extra_cost_r)
+        validate_cost_stress_step(
+            row, stressed, extra_cost_r, previous=previous,
+            context=f"{row.get('config', 'unknown')} fold={row.get('fold', 'n/a')}",
+        )
         suffix = f"{extra_cost_r:.2f}R"
         row[f"net_R_after_extra_{suffix}"] = stressed["net_R"]
         row[f"PF_after_extra_{suffix}"] = stressed["profit_factor"]
@@ -428,6 +462,7 @@ def add_cost_stress(row, trades, days):
         row[f"max_drawdown_R_after_extra_{suffix}"] = stressed["max_drawdown_R"]
         row[f"gross_profit_R_after_extra_{suffix}"] = stressed["gross_profit_R"]
         row[f"gross_loss_R_after_extra_{suffix}"] = stressed["gross_loss_R"]
+        previous = stressed
     return row
 
 
@@ -838,12 +873,21 @@ async def main():
             summary = {"config": cfg["name"], "period": period,
                        **metrics(trades, days)}
             summaries.append(summary)
-            for extra_cost_r in (0.05, 0.10, 0.15):
+            base_stats = summary
+            previous_stats = base_stats
+            for extra_cost_r in (0.05, 0.10, 0.15, 0.20, 0.25):
+                stressed_stats = metrics(trades, days, extra_cost_r=extra_cost_r)
+                validate_cost_stress_step(
+                    base_stats, stressed_stats, extra_cost_r,
+                    previous=previous_stats,
+                    context=f"{cfg['name']} {period}",
+                )
                 cost_stress.append({
                     "config": cfg["name"], "period": period,
                     "extra_cost_R_per_trade": extra_cost_r,
-                    **metrics(trades, days, extra_cost_r=extra_cost_r),
+                    **stressed_stats,
                 })
+                previous_stats = stressed_stats
 
     # Five sequential out-of-sample windows. Each fold starts flat, uses
     # only past candles for warm-up, and censors positions that remain open at
@@ -904,6 +948,12 @@ async def main():
         "F26_2h_long_local_and_btc4h_rr_1_5_strict",
         "F27_2h_short_btc4h_rr_1_5_strict",
         "F28_2h_short_local_and_btc4h_rr_1_5_strict",
+        "L1_4h_short_rr_1_5",
+        "L2_4h_short_rr_2_5",
+        "L3_4h_short_btc4h_rr_1_5",
+        "L4_4h_short_btc4h_rr_2_5",
+        "L5_4h_short_dual_btc_rr_1_5",
+        "L6_4h_short_dual_btc_rr_2_5",
     }
     folds = [(0.20, 0.36), (0.36, 0.52), (0.52, 0.68), (0.68, 0.84), (0.84, 1.00)]
     for cfg in CONFIGS:
@@ -1125,6 +1175,10 @@ async def main():
                 "test_PF_after_extra_0.10R": test_row["PF_after_extra_0.10R"],
                 "test_net_R_after_extra_0.15R": test_row["net_R_after_extra_0.15R"],
                 "test_PF_after_extra_0.15R": test_row["PF_after_extra_0.15R"],
+                "test_net_R_after_extra_0.20R": test_row["net_R_after_extra_0.20R"],
+                "test_PF_after_extra_0.20R": test_row["PF_after_extra_0.20R"],
+                "test_net_R_after_extra_0.25R": test_row["net_R_after_extra_0.25R"],
+                "test_PF_after_extra_0.25R": test_row["PF_after_extra_0.25R"],
                 "test_max_drawdown_R": test_row["max_drawdown_R"],
                 "status": "evaluated",
             })
@@ -1218,6 +1272,10 @@ async def main():
                 "test_PF_after_extra_0.10R": test_row["PF_after_extra_0.10R"],
                 "test_net_R_after_extra_0.15R": test_row["net_R_after_extra_0.15R"],
                 "test_PF_after_extra_0.15R": test_row["PF_after_extra_0.15R"],
+                "test_net_R_after_extra_0.20R": test_row["net_R_after_extra_0.20R"],
+                "test_PF_after_extra_0.20R": test_row["PF_after_extra_0.20R"],
+                "test_net_R_after_extra_0.25R": test_row["net_R_after_extra_0.25R"],
+                "test_PF_after_extra_0.25R": test_row["PF_after_extra_0.25R"],
                 "test_max_drawdown_R": test_row["max_drawdown_R"],
                 "status": "evaluated",
             })
@@ -1265,6 +1323,12 @@ async def main():
         "F26_2h_long_local_and_btc4h_rr_1_5_strict",
         "F27_2h_short_btc4h_rr_1_5_strict",
         "F28_2h_short_local_and_btc4h_rr_1_5_strict",
+        "L1_4h_short_rr_1_5",
+        "L2_4h_short_rr_2_5",
+        "L3_4h_short_btc4h_rr_1_5",
+        "L4_4h_short_btc4h_rr_2_5",
+        "L5_4h_short_dual_btc_rr_1_5",
+        "L6_4h_short_dual_btc_rr_2_5",
     }
     leave_one_coin_out = []
     for cfg in CONFIGS:
@@ -1289,6 +1353,8 @@ async def main():
                 base_stats = metrics(combined, period_days[period])
                 stressed_010 = metrics(combined, period_days[period], extra_cost_r=0.10)
                 stressed_015 = metrics(combined, period_days[period], extra_cost_r=0.15)
+                stressed_020 = metrics(combined, period_days[period], extra_cost_r=0.20)
+                stressed_025 = metrics(combined, period_days[period], extra_cost_r=0.25)
                 leave_one_coin_out.append({
                     "config": cfg["name"],
                     "period": period,
@@ -1304,6 +1370,12 @@ async def main():
                     "net_R_after_extra_0.15R": stressed_015["net_R"],
                     "PF_after_extra_0.15R": stressed_015["profit_factor"],
                     "max_drawdown_R_after_extra_0.15R": stressed_015["max_drawdown_R"],
+                    "net_R_after_extra_0.20R": stressed_020["net_R"],
+                    "PF_after_extra_0.20R": stressed_020["profit_factor"],
+                    "max_drawdown_R_after_extra_0.20R": stressed_020["max_drawdown_R"],
+                    "net_R_after_extra_0.25R": stressed_025["net_R"],
+                    "PF_after_extra_0.25R": stressed_025["profit_factor"],
+                    "max_drawdown_R_after_extra_0.25R": stressed_025["max_drawdown_R"],
                 })
 
     # Weekly block-bootstrap uncertainty for a fixed, predeclared shortlist.
@@ -1322,6 +1394,12 @@ async def main():
         "F14_2h_long_confirmed_by_4h_rr_2_5_strict",
         "F19_2h_long_local_and_btc4h_rr_2_5_strict",
         "F20_2h_short_local_and_btc4h_rr_2_5_strict",
+        "L1_4h_short_rr_1_5",
+        "L2_4h_short_rr_2_5",
+        "L3_4h_short_btc4h_rr_1_5",
+        "L4_4h_short_btc4h_rr_2_5",
+        "L5_4h_short_dual_btc_rr_1_5",
+        "L6_4h_short_dual_btc_rr_2_5",
     }
     bootstrap_uncertainty = []
     for cfg in CONFIGS:
@@ -1331,7 +1409,7 @@ async def main():
             combined_trades = []
             for coin in COINS:
                 combined_trades.extend(trades_cache.get((cfg["name"], coin, period), []))
-            for extra_cost_r in (0.0, 0.05, 0.10, 0.15):
+            for extra_cost_r in (0.0, 0.05, 0.10, 0.15, 0.20, 0.25):
                 for block_weeks in (2, 4, 8):
                     stable_seed = (
                         sum((idx + 1) * ord(ch) for idx, ch in enumerate(cfg["name"]))
@@ -1383,12 +1461,13 @@ async def main():
         "bootstrap_method": {
             "resampling_unit": "weekly portfolio returns pooled across coins",
             "block_lengths_weeks": [2, 4, 8],
+            "cost_stress_R_per_trade": [0.0, 0.05, 0.10, 0.15, 0.20, 0.25],
             "replicates_per_block_length": 2000,
             "confidence_level": 0.95,
             "note": "Block-length sensitivity is diagnostic; it does not establish stationarity or future profitability.",
         },
         "leave_one_coin_out": leave_one_coin_out, "per_coin": all_rows, "errors": errors,
-        "warning": "Research only. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. When BT_BOUNDS_REFERENCE is set, evaluation_start and evaluation_end are anchored to that reference run for an apples-to-apples universe comparison; an unanchored no-ZEC run separately measures the longer-history effect. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.15R/trade stress using trade-level gross profit/loss aggregation. An additional seven-window sequential walk-forward and nested selection require positive stressed results in every prior selection window. Break-even variants activate only after a candle close and use the next candle onward. Additional +0.15R stress and leave-one-coin-out checks are included. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
+        "warning": "Research only. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. Cost stress is checked through +0.25R per trade with monotonicity assertions.  When BT_BOUNDS_REFERENCE is set, evaluation_start and evaluation_end are anchored to that reference run for an apples-to-apples universe comparison; an unanchored no-ZEC run separately measures the longer-history effect. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.15R/trade stress using trade-level gross profit/loss aggregation. An additional seven-window sequential walk-forward and nested selection require positive stressed results in every prior selection window. Break-even variants activate only after a candle close and use the next candle onward. Additional +0.15R stress and leave-one-coin-out checks are included. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
     }
     (OUT / "summary.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({"summary": summaries, "errors": errors}, indent=2))
