@@ -433,7 +433,8 @@ def metrics(trades, days, extra_cost_r=0.0):
 
 def validate_cost_stress_step(base, stressed, extra_cost_r, previous=None, context=""):
     expected_net = round(float(base["net_R"]) - extra_cost_r * int(base["trades"]), 3)
-    if abs(float(stressed["net_R"]) - expected_net) > 0.001:
+    # Both aggregates are rounded to 0.001R independently; allow two ticks for rounding drift.
+    if abs(float(stressed["net_R"]) - expected_net) > 0.002:
         raise RuntimeError(
             f"{context}: net_R stress mismatch at +{extra_cost_r:.2f}R; "
             f"expected {expected_net}, got {stressed['net_R']}"
