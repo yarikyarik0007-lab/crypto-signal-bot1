@@ -9,10 +9,9 @@ on:
 permissions:
   contents: read
 
-# PR and push events previously launched duplicate 45-minute research jobs.
 # Keep only one active run for this branch and cancel stale runs on new commits.
 concurrency:
-  group: frequency-strategy-research-\${{ github.ref }}
+  group: frequency-strategy-research-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
