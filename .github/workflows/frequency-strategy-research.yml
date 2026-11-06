@@ -12,7 +12,7 @@ permissions:
 # PR and push events previously launched duplicate 45-minute research jobs.
 # Keep only one active run for this branch and cancel stale runs on new commits.
 concurrency:
-  group: frequency-strategy-research-${{ github.ref }}
+  group: frequency-strategy-research-\${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -29,7 +29,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Compile research harness
-        run: python -m py_compile bot.py research/frequency_strategy_test.py
+        run: python -m py_compile bot.py research/frequency_strategy_test.py research/validate_frequency_results.py
       - name: Run 4h baseline and 1h candidate comparisons
         run: python research/frequency_strategy_test.py
         env:
@@ -67,4 +67,13 @@ jobs:
         with:
           name: frequency-strategy-results-no-zec-extended
           path: frequency-results-no-zec-extended/
+          if-no-files-found: warn
+      - name: Build conservative cross-universe candidate gate
+        run: python research/validate_frequency_results.py
+      - name: Upload cross-universe candidate gate
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frequency-strategy-candidate-gate
+          path: frequency-gate/
           if-no-files-found: warn
