@@ -44,6 +44,64 @@ def aggregate_fold_rows(summary, field, config):
     ]
 
 
+def diagnostic_coverage(config, loaded):
+    """Separate absent diagnostics from a genuine strategy failure."""
+    missing = {}
+    for dataset_name, summary in loaded.items():
+        issues = []
+        available = {item.get("name") for item in summary.get("configs", [])}
+        if config not in available:
+            issues.append("configuration is absent")
+        if summary.get("errors"):
+            issues.append(f"artifact contains {len(summary['errors'])} data errors")
+
+        for period in ("train", "holdout"):
+            for cost in REQUIRED_COSTS:
+                if cost_row(summary, config, period, cost) is None:
+                    issues.append(f"missing unique cost-stress row: {period} +{cost:.2f}R")
+
+        for field, expected in (("walk_forward", 5), ("walk_forward_dense", 7)):
+            count = len(aggregate_fold_rows(summary, field, config))
+            if count != expected:
+                issues.append(f"{field}: expected {expected} portfolio folds, found {count}")
+
+        boot_rows = [
+            row for row in summary.get("bootstrap_uncertainty", [])
+            if row.get("config") == config
+            and close(row.get("extra_cost_R_per_trade", -999), BOOTSTRAP_COST)
+            and row.get("period") in ("train", "holdout")
+        ]
+        observed_boot = {
+            (row.get("period"), int(row.get("bootstrap_block_weeks", -1)))
+            for row in boot_rows
+        }
+        expected_boot = {
+            (period, block)
+            for period in ("train", "holdout")
+            for block in BOOTSTRAP_BLOCKS
+        }
+        if observed_boot != expected_boot or len(boot_rows) != len(expected_boot):
+            issues.append("bootstrap coverage is incomplete at +0.15R for 2/4/8-week blocks")
+
+        expected_coins = set(summary.get("coin_universe", []))
+        exclusions = {
+            row.get("excluded_coin")
+            for row in summary.get("leave_one_coin_out", [])
+            if row.get("config") == config
+            and row.get("period") == "holdout"
+            and row.get("excluded_coin") != "NONE"
+        }
+        if exclusions != expected_coins:
+            issues.append(
+                f"leave-one-coin-out holdout coverage: expected {len(expected_coins)} distinct exclusions, "
+                f"found {len(exclusions)}"
+            )
+
+        if issues:
+            missing[dataset_name] = issues
+    return missing
+
+
 def evaluate_config(config, loaded):
     failures = []
     checks = {
@@ -234,8 +292,19 @@ def main():
     if not common_configs:
         raise SystemExit("No common predeclared configurations across the three datasets")
 
-    evaluations = {name: evaluate_config(name, loaded) for name in common_configs}
+    coverage = {name: diagnostic_coverage(name, loaded) for name in common_configs}
+    fully_diagnosed = sorted(name for name, missing in coverage.items() if not missing)
+    not_fully_evaluated = {
+        name: missing for name, missing in coverage.items() if missing
+    }
+    evaluations = {name: evaluate_config(name, loaded) for name in fully_diagnosed}
     passed = [name for name, result in evaluations.items() if result["passed"]]
+    if passed:
+        status = "candidate_passed_research_screen"
+    elif fully_diagnosed:
+        status = "no_candidate_passed_research_screen"
+    else:
+        status = "insufficient_diagnostic_coverage"
     report = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "purpose": "Conservative research-only cross-universe candidate screen; not a production approval.",
@@ -270,9 +339,18 @@ def main():
             "note": "These conservative screening rules reduce winner's-curse risk but do not prove future profitability. +0.25R is reported as sensitivity, not a hard gate.",
         },
         "common_configuration_count": len(common_configs),
+        "fully_diagnosed_configuration_count": len(fully_diagnosed),
+        "fully_diagnosed_configurations": fully_diagnosed,
+        "not_fully_evaluated_configuration_count": len(not_fully_evaluated),
+        "not_fully_evaluated_configs": not_fully_evaluated,
         "passed_candidate_count": len(passed),
         "passed_candidates": passed,
-        "status": "candidate_passed_research_screen" if passed else "no_candidate_passed_research_screen",
+        "status": status,
+        "coverage_note": (
+            "Only configurations with complete cost-stress, 5/7 walk-forward, "
+            "bootstrap and per-coin holdout diagnostics are evaluated as candidates. "
+            "Other configurations are marked not_fully_evaluated, not rejected."
+        ),
         "evaluations": evaluations,
     }
     out_path = OUT / "candidate_gate.json"
