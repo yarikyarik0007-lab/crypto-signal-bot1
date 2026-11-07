@@ -172,6 +172,25 @@ CONFIGS = [
      "tol": 0.006, "window": 8, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 1.5},
     {"name": "L6_4h_short_dual_btc_rr_2_5", "interval": "4h", "margin": 0.005, "volume": 1.0,
      "tol": 0.006, "window": 8, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 2.5},
+    # New predeclared hypothesis: local and BTC regimes must agree at both breakout and retest.
+    {"name": "M1_4h_short_dual_breakout_retest_rr_2_0", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "require_breakout_regime_confirmation": True},
+    {"name": "M2_4h_long_dual_breakout_retest_rr_2_0", "interval": "4h", "margin": 0.005, "volume": 1.0,
+     "tol": 0.006, "window": 8, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "require_breakout_regime_confirmation": True},
+    {"name": "M3_2h_short_dual_btc_breakout_retest_rr_2_0_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "require_breakout_regime_confirmation": True},
+    {"name": "M4_2h_long_dual_btc_breakout_retest_rr_2_0_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "require_breakout_regime_confirmation": True},
+    {"name": "M5_2h_short_dual_btc_breakout_retest_rr_1_5_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 1.5,
+     "require_breakout_regime_confirmation": True},
+    {"name": "M6_2h_long_dual_btc_breakout_retest_rr_1_5_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 1.5,
+     "require_breakout_regime_confirmation": True},
 ]
 
 
@@ -244,6 +263,12 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
                     (p["dir"] == "LONG" and (regime != "TREND_UP" or market_regime != "TREND_UP"))
                     or (p["dir"] == "SHORT" and (regime != "TREND_DOWN" or market_regime != "TREND_DOWN"))
                 ):
+                    continue
+            if cfg.get("require_breakout_regime_confirmation"):
+                breakout_expected = "TREND_UP" if p["dir"] == "LONG" else "TREND_DOWN"
+                if p.get("breakout_regime") != breakout_expected:
+                    continue
+                if cfg.get("market_htf") and p.get("breakout_market_regime") != breakout_expected:
                     continue
             if p["dir"] == "LONG":
                 touch = sig["l"] <= p["level"] * (1 + cfg["tol"])
@@ -377,10 +402,12 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
         vol_ok = avg_vol == 0 or sig["v"] >= avg_vol * cfg["volume"]
         if vol_ok and resistance and sig["c"] > resistance * (1 + cfg["margin"]):
             if not any(p["dir"] == "LONG" and p["level"] == resistance for p in pending):
-                pending.append({"dir": "LONG", "level": resistance, "breakout_i": i})
+                pending.append({"dir": "LONG", "level": resistance, "breakout_i": i,
+                                "breakout_regime": regime, "breakout_market_regime": market_regime})
         if vol_ok and support and sig["c"] < support * (1 - cfg["margin"]):
             if not any(p["dir"] == "SHORT" and p["level"] == support for p in pending):
-                pending.append({"dir": "SHORT", "level": support, "breakout_i": i})
+                pending.append({"dir": "SHORT", "level": support, "breakout_i": i,
+                                "breakout_regime": regime, "breakout_market_regime": market_regime})
         i += 1
     return trades
 
@@ -955,6 +982,12 @@ async def main():
         "L4_4h_short_btc4h_rr_2_5",
         "L5_4h_short_dual_btc_rr_1_5",
         "L6_4h_short_dual_btc_rr_2_5",
+        "M1_4h_short_dual_breakout_retest_rr_2_0",
+        "M2_4h_long_dual_breakout_retest_rr_2_0",
+        "M3_2h_short_dual_btc_breakout_retest_rr_2_0_strict",
+        "M4_2h_long_dual_btc_breakout_retest_rr_2_0_strict",
+        "M5_2h_short_dual_btc_breakout_retest_rr_1_5_strict",
+        "M6_2h_long_dual_btc_breakout_retest_rr_1_5_strict",
     }
     folds = [(0.20, 0.36), (0.36, 0.52), (0.52, 0.68), (0.68, 0.84), (0.84, 1.00)]
     for cfg in CONFIGS:
@@ -1330,6 +1363,12 @@ async def main():
         "L4_4h_short_btc4h_rr_2_5",
         "L5_4h_short_dual_btc_rr_1_5",
         "L6_4h_short_dual_btc_rr_2_5",
+        "M1_4h_short_dual_breakout_retest_rr_2_0",
+        "M2_4h_long_dual_breakout_retest_rr_2_0",
+        "M3_2h_short_dual_btc_breakout_retest_rr_2_0_strict",
+        "M4_2h_long_dual_btc_breakout_retest_rr_2_0_strict",
+        "M5_2h_short_dual_btc_breakout_retest_rr_1_5_strict",
+        "M6_2h_long_dual_btc_breakout_retest_rr_1_5_strict",
     }
     leave_one_coin_out = []
     for cfg in CONFIGS:
@@ -1401,6 +1440,12 @@ async def main():
         "L4_4h_short_btc4h_rr_2_5",
         "L5_4h_short_dual_btc_rr_1_5",
         "L6_4h_short_dual_btc_rr_2_5",
+        "M1_4h_short_dual_breakout_retest_rr_2_0",
+        "M2_4h_long_dual_breakout_retest_rr_2_0",
+        "M3_2h_short_dual_btc_breakout_retest_rr_2_0_strict",
+        "M4_2h_long_dual_btc_breakout_retest_rr_2_0_strict",
+        "M5_2h_short_dual_btc_breakout_retest_rr_1_5_strict",
+        "M6_2h_long_dual_btc_breakout_retest_rr_1_5_strict",
     }
     bootstrap_uncertainty = []
     for cfg in CONFIGS:
