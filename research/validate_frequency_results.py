@@ -217,8 +217,7 @@ def evaluate_config(config, loaded):
                 low = row.get("mean_R_ci95_low")
                 share = row.get("bootstrap_probability_mean_R_positive")
                 count = int(row.get("completed_trades", 0))
-                boot_details.append({
-                    "period": period,
+                boot_details.append({                    "period": period,
                     "block_weeks": block,
                     "completed_trades": count,
                     "mean_R_ci95_low": low,
@@ -274,6 +273,66 @@ def evaluate_config(config, loaded):
     }
 
 
+def evaluate_nested_selection(summary, field, minimum_evaluated_folds):
+    """Evaluate the chronological model-selection test, not just fixed candidates."""
+    rows = summary.get(field, [])
+    evaluated = [row for row in rows if row.get("status") == "evaluated"]
+    status_counts = {}
+    for row in rows:
+        status = row.get("status", "missing status")
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    failures = []
+    observed = []
+    for row in sorted(evaluated, key=lambda item: (item.get("interval", ""), int(item.get("test_fold", 0)))):
+        trades = int(row.get("test_trades", 0))
+        net_015 = float(row.get("test_net_R_after_extra_0.15R", 0.0))
+        pf_015 = float(row.get("test_PF_after_extra_0.15R", 0.0))
+        net_020 = float(row.get("test_net_R_after_extra_0.20R", 0.0))
+        pf_020 = float(row.get("test_PF_after_extra_0.20R", 0.0))
+        item = {
+            "interval": row.get("interval"),
+            "test_fold": row.get("test_fold"),
+            "selected_config": row.get("selected_config"),
+            "selection_folds": row.get("selection_folds", []),
+            "test_trades": trades,
+            "test_win_rate_pct": row.get("test_win_rate_pct"),
+            "net_R_after_0.15R": net_015,
+            "PF_after_0.15R": pf_015,
+            "net_R_after_0.20R": net_020,
+            "PF_after_0.20R": pf_020,
+        }
+        observed.append(item)
+        if trades < MIN_FOLD_TRADES:
+            failures.append(f"{item['interval']} fold {item['test_fold']}: only {trades} test trades")
+        if net_015 <= 0 or pf_015 <= 1.0:
+            failures.append(
+                f"{item['interval']} fold {item['test_fold']} at +0.15R: "
+                f"Net R {net_015:.3f}, PF {pf_015:.3f}"
+            )
+        if net_020 <= 0 or pf_020 <= 1.0:
+            failures.append(
+                f"{item['interval']} fold {item['test_fold']} at +0.20R: "
+                f"Net R {net_020:.3f}, PF {pf_020:.3f}"
+            )
+
+    if len(evaluated) < minimum_evaluated_folds:
+        state = "insufficient_coverage"
+    elif failures:
+        state = "failed"
+    else:
+        state = "passed"
+
+    return {
+        "status": state,
+        "minimum_evaluated_folds": minimum_evaluated_folds,
+        "evaluated_fold_count": len(evaluated),
+        "status_counts": status_counts,
+        "failures": failures,
+        "observed": observed,
+    }
+
+
 def main():
     loaded = {}
     for name, path in DATASETS.items():
@@ -298,7 +357,24 @@ def main():
         name: missing for name, missing in coverage.items() if missing
     }
     evaluations = {name: evaluate_config(name, loaded) for name in fully_diagnosed}
-    passed = [name for name, result in evaluations.items() if result["passed"]]
+    nested_selection = {
+        name: {
+            "standard": evaluate_nested_selection(summary, "nested_walk_forward", 2),
+            "dense": evaluate_nested_selection(summary, "nested_walk_forward_dense", 3),
+        }
+        for name, summary in loaded.items()
+    }
+    nested_selection_passed = all(
+        result["standard"]["status"] == "passed"
+        and result["dense"]["status"] == "passed"
+        for result in nested_selection.values()
+    )
+    individually_passed = [
+        name for name, result in evaluations.items() if result["passed"]
+    ]
+    # A candidate is not promoted from a fixed-split screen if chronological
+    # model selection itself fails or lacks enough evaluated out-of-sample folds.
+    passed = individually_passed if nested_selection_passed else []
     if passed:
         status = "candidate_passed_research_screen"
     elif fully_diagnosed:
@@ -336,6 +412,13 @@ def main():
                 "require_lower_95_percent_mean_R_bound_above_zero": True,
             },
             "leave_one_coin_out": "Every holdout exclusion must retain at least 8 trades, positive Net R and PF above 1 after +0.15R.",
+            "nested_model_selection": {
+                "standard_minimum_evaluated_test_folds_per_dataset": 2,
+                "dense_minimum_evaluated_test_folds_per_dataset": 3,
+                "minimum_test_trades": MIN_FOLD_TRADES,
+                "require_positive_net_R_and_PF_above_1_after_costs": [0.15, 0.20],
+                "all_evaluated_test_folds_must_pass": True,
+            },
             "note": "These conservative screening rules reduce winner's-curse risk but do not prove future profitability. +0.25R is reported as sensitivity, not a hard gate.",
         },
         "common_configuration_count": len(common_configs),
@@ -343,13 +426,19 @@ def main():
         "fully_diagnosed_configurations": fully_diagnosed,
         "not_fully_evaluated_configuration_count": len(not_fully_evaluated),
         "not_fully_evaluated_configs": not_fully_evaluated,
+        "individually_passed_candidate_count": len(individually_passed),
+        "individually_passed_candidates": individually_passed,
+        "nested_model_selection": nested_selection,
+        "nested_model_selection_passed": nested_selection_passed,
         "passed_candidate_count": len(passed),
         "passed_candidates": passed,
         "status": status,
         "coverage_note": (
             "Only configurations with complete cost-stress, 5/7 walk-forward, "
             "bootstrap and per-coin holdout diagnostics are evaluated as candidates. "
-            "Other configurations are marked not_fully_evaluated, not rejected."
+            "Chronological nested model-selection must also pass standard and dense "
+            "out-of-sample folds across all datasets. Other configurations are marked "
+            "not_fully_evaluated, not rejected."
         ),
         "evaluations": evaluations,
     }
