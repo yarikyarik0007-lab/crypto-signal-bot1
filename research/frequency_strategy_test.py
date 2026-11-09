@@ -191,6 +191,15 @@ CONFIGS = [
     {"name": "M6_2h_long_dual_btc_breakout_retest_rr_1_5_strict", "interval": "2h", "margin": 0.006, "volume": 1.2,
      "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 1.5,
      "require_breakout_regime_confirmation": True},
+    # Predeclared 2h LONG exit-management checks on the same M4 entry filter.
+    # M7 exits at the next open after a local or BTC regime flip; M8 uses a causal 6-bar time stop.
+    {"name": "M7_2h_long_dual_breakout_retest_rr_2_0_regime_flip", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "require_breakout_regime_confirmation": True, "exit_on_local_regime_flip": True,
+     "exit_on_market_regime_flip": True},
+    {"name": "M8_2h_long_dual_breakout_retest_rr_2_0_time_stop_6", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "require_breakout_regime_confirmation": True, "max_hold_bars": 6},
 ]
 
 
@@ -922,6 +931,8 @@ async def main():
     # the fold boundary. No fold can borrow a future exit from a later window.
     walk_forward = []
     shortlist = {
+        "M7_2h_long_dual_breakout_retest_rr_2_0_regime_flip",
+        "M8_2h_long_dual_breakout_retest_rr_2_0_time_stop_6",
         "A_4h_current_short_only",
         "G1_4h_short_confirmed_by_btc4h",
         "G2_4h_short_local_and_btc4h",
@@ -1318,6 +1329,12 @@ async def main():
     # LONG/SHORT candidates. This checks whether aggregate performance depends
     # on a single asset; all costs are applied trade-by-trade before PF/DD.
     robustness_names = {
+        "J1_4h_short_btc_regime_flip_exit",
+        "J2_4h_short_dual_regime_flip_exit",
+        "J3_4h_long_dual_regime_flip_exit",
+        "J4_4h_both_dual_regime_flip_exit",
+        "M7_2h_long_dual_breakout_retest_rr_2_0_regime_flip",
+        "M8_2h_long_dual_breakout_retest_rr_2_0_time_stop_6",
         "A_4h_current_short_only",
         "G1_4h_short_confirmed_by_btc4h",
         "G2_4h_short_local_and_btc4h",
@@ -1422,6 +1439,12 @@ async def main():
     # This is reported separately from candidate selection to reduce winner's-curse
     # risk; it must not be used to tune thresholds against the holdout.
     bootstrap_names = {
+        "H3_4h_short_dual_btc_time_stop_6",
+        "H4_4h_long_dual_btc_time_stop_6",
+        "J3_4h_long_dual_regime_flip_exit",
+        "J4_4h_both_dual_regime_flip_exit",
+        "M7_2h_long_dual_breakout_retest_rr_2_0_regime_flip",
+        "M8_2h_long_dual_breakout_retest_rr_2_0_time_stop_6",
         "A_4h_current_short_only",
         "G1_4h_short_confirmed_by_btc4h",
         "G2_4h_short_local_and_btc4h",
