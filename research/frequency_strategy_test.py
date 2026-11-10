@@ -6,6 +6,8 @@ import os
 import sys
 import bisect
 import random
+import logging
+import math
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -17,7 +19,15 @@ _EXCLUDED_COINS = {coin.strip().upper() for coin in os.getenv("BT_EXCLUDE_COINS"
 COINS = [coin for coin in list(bot.COINS) if coin.upper() not in _EXCLUDED_COINS]
 if not COINS:
     raise RuntimeError("BT_EXCLUDE_COINS removed every coin from the research universe")
-TARGET = int(os.getenv("BT_CANDLES", "4000"))
+BASE_TARGET = int(os.getenv("BT_CANDLES", "4000"))
+# 1h was limited to 5,000 candles (~7 months), too short for robust
+# multi-regime validation. Keep 2h/4h at the configured baseline and
+# request a longer 1h history only in this isolated research harness.
+TARGETS = {
+    "1h": int(os.getenv("BT_CANDLES_1H", str(BASE_TARGET))),
+    "2h": int(os.getenv("BT_CANDLES_2H", str(BASE_TARGET))),
+    "4h": int(os.getenv("BT_CANDLES_4H", str(BASE_TARGET))),
+}
 TRAIN_FRACTION = 0.70
 OUT = Path(os.getenv("BT_OUT_DIR", "frequency-results"))
 OUT.mkdir(exist_ok=True)
@@ -598,9 +608,126 @@ def weekly_block_bootstrap(trades, extra_cost_r, seed, n_boot=1000, block_weeks=
     }
 
 
+async def fetch_research_historical_klines(session, symbol, interval, target, page_size=500):
+    """Research-only backward pagination; production bot.py remains untouched."""
+    if target <= 0:
+        return []
+
+    all_by_time = {}
+    end_time = None
+    max_pages = (target + page_size - 1) // page_size + 4
+    url = f"{bot.BINGX_BASE}/openApi/swap/v2/quote/klines"
+
+    for page_no in range(max_pages):
+        params = {"symbol": symbol, "interval": interval, "limit": page_size}
+        if end_time is not None:
+            params["endTime"] = end_time
+
+        payload = None
+        for attempt in range(4):
+            try:
+                async with session.get(
+                    url, params=params, timeout=aiohttp.ClientTimeout(total=20)
+                ) as response:
+                    if response.status in (418, 429, 500, 502, 503, 504):
+                        retry_after = response.headers.get("Retry-After", "0")
+                        try:
+                            wait_s = max(float(retry_after), 0.5 * (2 ** attempt))
+                        except (TypeError, ValueError):
+                            wait_s = 0.5 * (2 ** attempt)
+                        await asyncio.sleep(wait_s)
+                        continue
+                    if response.status != 200:
+                        logging.warning(
+                            "Research kline pagination stopped for %s %s: HTTP %s",
+                            symbol, interval, response.status,
+                        )
+                        break
+                    payload = await response.json(content_type=None)
+                    break
+            except Exception as exc:
+                if attempt == 3:
+                    logging.warning(
+                        "Research kline request failed for %s %s page %s: %r",
+                        symbol, interval, page_no + 1, exc,
+                    )
+                else:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+
+        raw = payload.get("data") if isinstance(payload, dict) else None
+        if not raw:
+            break
+
+        batch_by_time = {}
+        for item in raw:
+            try:
+                if isinstance(item, dict):
+                    t = int(item.get("time"))
+                    o, h, l, c = (
+                        float(item.get("open")), float(item.get("high")),
+                        float(item.get("low")), float(item.get("close")),
+                    )
+                    v = float(item.get("volume", 0) or 0)
+                elif isinstance(item, (list, tuple)) and len(item) >= 6:
+                    t = int(item[0])
+                    o, h, l, c, v = (
+                        float(item[1]), float(item[2]), float(item[3]),
+                        float(item[4]), float(item[5]),
+                    )
+                else:
+                    continue
+                prices = (o, h, l, c)
+                if (
+                    t <= 0
+                    or not all(math.isfinite(value) and value > 0 for value in prices)
+                    or not math.isfinite(v)
+                    or v < 0
+                    or l > min(o, c)
+                    or h < max(o, c)
+                    or l > h
+                ):
+                    continue
+                batch_by_time[t] = {"t": t, "o": o, "h": h, "l": l, "c": c, "v": v}
+            except (TypeError, ValueError, OverflowError):
+                continue
+
+        if not batch_by_time:
+            break
+        batch = sorted(batch_by_time.values(), key=lambda candle: candle["t"])
+        existing_min_t = min(all_by_time) if all_by_time else None
+        if existing_min_t is not None:
+            batch = [candle for candle in batch if candle["t"] < existing_min_t]
+        if not batch:
+            break
+
+        for candle in batch:
+            all_by_time[candle["t"]] = candle
+        if len(all_by_time) >= target:
+            break
+
+        next_end_time = batch[0]["t"] - 1
+        if end_time is not None and next_end_time >= end_time:
+            logging.warning(
+                "Research kline pagination did not move backwards for %s %s",
+                symbol, interval,
+            )
+            break
+        end_time = next_end_time
+        await asyncio.sleep(0.05)
+
+    candles = sorted(all_by_time.values(), key=lambda candle: candle["t"])
+    if len(candles) < target:
+        logging.warning(
+            "Research history shortfall for %s %s: requested %s, received %s",
+            symbol, interval, target, len(candles),
+        )
+    return candles[-target:]
+
+
 async def load(session, coin, interval):
-    bot._SESSION = session
-    candles = await bot.fetch_historical_klines(f"{coin}-USDT", interval, TARGET)
+    candles = await fetch_research_historical_klines(
+        session, f"{coin}-USDT", interval, TARGETS[interval]
+    )
     interval_ms = {"1h": 60, "2h": 120, "4h": 240}[interval] * 60 * 1000
     now_ms = int(__import__("time").time() * 1000)
     return [c for c in candles if c.get("t") and now_ms - c["t"] >= interval_ms]
@@ -1521,6 +1648,14 @@ async def main():
         "coin_universe": COINS,
         "excluded_coins": sorted(_EXCLUDED_COINS),
         "calendar_bounds_reference": os.getenv("BT_BOUNDS_REFERENCE"),
+        "requested_history_candles_per_interval": TARGETS,
+        "actual_history_candles_per_coin": {
+            interval: {
+                coin: len(cache.get((coin, interval), []))
+                for coin in COINS
+            }
+            for interval in intervals_needed
+        },
         "configs": CONFIGS, "calendar_windows": calendar_windows,
         "summary": summaries, "cost_stress": cost_stress,
         "walk_forward": walk_forward, "nested_walk_forward": nested_walk_forward,
@@ -1536,7 +1671,7 @@ async def main():
             "note": "Block-length sensitivity is diagnostic; it does not establish stationarity or future profitability.",
         },
         "leave_one_coin_out": leave_one_coin_out, "per_coin": all_rows, "errors": errors,
-        "warning": "Research only. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. Cost stress is checked through +0.25R per trade with monotonicity assertions.  When BT_BOUNDS_REFERENCE is set, evaluation_start and evaluation_end are anchored to that reference run for an apples-to-apples universe comparison; an unanchored no-ZEC run separately measures the longer-history effect. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.15R/trade stress using trade-level gross profit/loss aggregation. An additional seven-window sequential walk-forward and nested selection require positive stressed results in every prior selection window. Break-even variants activate only after a candle close and use the next candle onward. Additional +0.15R stress and leave-one-coin-out checks are included. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
+        "warning": "Research only. The 1h interval uses a research-only backward paginator and can request up to 10,000 candles; 2h/4h retain their configured targets. Actual per-coin candle counts are recorded above. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. Cost stress is checked through +0.25R per trade with monotonicity assertions. When BT_BOUNDS_REFERENCE is set, evaluation_start and evaluation_end are anchored to that reference run for an apples-to-apples universe comparison; an unanchored no-ZEC run separately measures the longer-history effect. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.15R/trade stress using trade-level gross profit/loss aggregation. An additional seven-window sequential walk-forward and nested selection require positive stressed results in every prior selection window. Break-even variants activate only after a candle close and use the next candle onward. Additional +0.15R stress and leave-one-coin-out checks are included. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
     }
     (OUT / "summary.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({"summary": summaries, "errors": errors}, indent=2))
