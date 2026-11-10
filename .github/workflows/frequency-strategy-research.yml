@@ -17,7 +17,7 @@ concurrency:
 jobs:
   frequency-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout isolated research branch
         uses: actions/checkout@v4
@@ -33,6 +33,7 @@ jobs:
         run: python research/frequency_strategy_test.py
         env:
           BT_CANDLES: '5000'
+          BT_CANDLES_1H: '10000'
       - name: Upload 11-coin frequency results
         if: always()
         uses: actions/upload-artifact@v4
@@ -44,6 +45,7 @@ jobs:
         run: python research/frequency_strategy_test.py
         env:
           BT_CANDLES: '5000'
+          BT_CANDLES_1H: '10000'
           BT_EXCLUDE_COINS: 'ZEC'
           BT_BOUNDS_REFERENCE: 'frequency-results/summary.json'
           BT_OUT_DIR: 'frequency-results-no-zec-matched'
@@ -58,6 +60,7 @@ jobs:
         run: python research/frequency_strategy_test.py
         env:
           BT_CANDLES: '5000'
+          BT_CANDLES_1H: '10000'
           BT_EXCLUDE_COINS: 'ZEC'
           BT_OUT_DIR: 'frequency-results-no-zec-extended'
       - name: Upload 10-coin extended-history results
