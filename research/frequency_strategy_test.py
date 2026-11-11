@@ -210,6 +210,14 @@ CONFIGS = [
     {"name": "M8_2h_long_dual_breakout_retest_rr_2_0_time_stop_6", "interval": "2h", "margin": 0.006, "volume": 1.2,
      "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
      "require_breakout_regime_confirmation": True, "max_hold_bars": 6},
+    # Predeclared 1h analogues of the strict 2h local+BTC regime family.
+    # These are evaluated on the longer 1h history; no thresholds are tuned on holdout.
+    {"name": "N1_1h_long_local_and_btc4h_rr_2_0_strict", "interval": "1h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "require_breakout_regime_confirmation": True},
+    {"name": "N2_1h_short_local_and_btc4h_rr_2_0_strict", "interval": "1h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "require_breakout_regime_confirmation": True},
 ]
 
 
@@ -1084,6 +1092,8 @@ async def main():
         "B1_1h_long_only",
         "C_1h_balanced_both_directions",
         "D_1h_more_opportunities",
+        "E_1h_volume_filter_removed",
+        "F2_1h_long_confirmed_by_4h",
         "B2_2h_current_short_only",
         "B3_2h_long_only",
         "C2_2h_balanced_both_directions",
@@ -1092,6 +1102,8 @@ async def main():
         "F4_2h_long_confirmed_by_4h_balanced",
         "F5_1h_short_confirmed_by_4h",
         "F6_1h_both_directions_confirmed_by_4h",
+        "N1_1h_long_local_and_btc4h_rr_2_0_strict",
+        "N2_1h_short_local_and_btc4h_rr_2_0_strict",
         "F7_2h_short_confirmed_by_4h",
         "F8_2h_long_confirmed_by_4h_rr_1_5",
         "F9_2h_long_confirmed_by_4h_rr_2_5",
@@ -1513,6 +1525,10 @@ async def main():
         "M4_2h_long_dual_btc_breakout_retest_rr_2_0_strict",
         "M5_2h_short_dual_btc_breakout_retest_rr_1_5_strict",
         "M6_2h_long_dual_btc_breakout_retest_rr_1_5_strict",
+        "B_1h_current_short_only",
+        "F5_1h_short_confirmed_by_4h",
+        "N1_1h_long_local_and_btc4h_rr_2_0_strict",
+        "N2_1h_short_local_and_btc4h_rr_2_0_strict",
     }
     leave_one_coin_out = []
     for cfg in CONFIGS:
@@ -1596,6 +1612,10 @@ async def main():
         "M4_2h_long_dual_btc_breakout_retest_rr_2_0_strict",
         "M5_2h_short_dual_btc_breakout_retest_rr_1_5_strict",
         "M6_2h_long_dual_btc_breakout_retest_rr_1_5_strict",
+        "B_1h_current_short_only",
+        "F5_1h_short_confirmed_by_4h",
+        "N1_1h_long_local_and_btc4h_rr_2_0_strict",
+        "N2_1h_short_local_and_btc4h_rr_2_0_strict",
     }
     bootstrap_uncertainty = []
     for cfg in CONFIGS:
