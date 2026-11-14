@@ -226,6 +226,14 @@ CONFIGS = [
     {"name": "N4_1h_short_btc4h_persistence_2_rr_2_0", "interval": "1h", "margin": 0.006, "volume": 1.2,
      "tol": 0.005, "window": 6, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
      "require_breakout_regime_confirmation": True, "market_regime_min_bars": 2},
+    # Controlled 2h ablation: same entry definitions as F21/F22, adding only
+    # two completed BTC 4h regime bars at both breakout and retest.
+    {"name": "O1_2h_long_btc4h_persistence_2_rr_2_0", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "market_regime_min_bars": 2},
+    {"name": "O2_2h_long_local_and_btc4h_persistence_2_rr_2_0", "interval": "2h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "market_regime_min_bars": 2},
 ]
 
 
@@ -1164,6 +1172,8 @@ async def main():
         "F26_2h_long_local_and_btc4h_rr_1_5_strict",
         "F27_2h_short_btc4h_rr_1_5_strict",
         "F28_2h_short_local_and_btc4h_rr_1_5_strict",
+        "O1_2h_long_btc4h_persistence_2_rr_2_0",
+        "O2_2h_long_local_and_btc4h_persistence_2_rr_2_0",
         "L1_4h_short_rr_1_5",
         "L2_4h_short_rr_2_5",
         "L3_4h_short_btc4h_rr_1_5",
@@ -1561,6 +1571,8 @@ async def main():
         "F26_2h_long_local_and_btc4h_rr_1_5_strict",
         "F27_2h_short_btc4h_rr_1_5_strict",
         "F28_2h_short_local_and_btc4h_rr_1_5_strict",
+        "O1_2h_long_btc4h_persistence_2_rr_2_0",
+        "O2_2h_long_local_and_btc4h_persistence_2_rr_2_0",
         "L1_4h_short_rr_1_5",
         "L2_4h_short_rr_2_5",
         "L3_4h_short_btc4h_rr_1_5",
@@ -1658,6 +1670,8 @@ async def main():
         "F26_2h_long_local_and_btc4h_rr_1_5_strict",
         "F27_2h_short_btc4h_rr_1_5_strict",
         "F28_2h_short_local_and_btc4h_rr_1_5_strict",
+        "O1_2h_long_btc4h_persistence_2_rr_2_0",
+        "O2_2h_long_local_and_btc4h_persistence_2_rr_2_0",
         "L1_4h_short_rr_1_5",
         "L2_4h_short_rr_2_5",
         "L3_4h_short_btc4h_rr_1_5",
