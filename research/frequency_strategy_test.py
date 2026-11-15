@@ -226,6 +226,21 @@ CONFIGS = [
     {"name": "N4_1h_short_btc4h_persistence_2_rr_2_0", "interval": "1h", "margin": 0.006, "volume": 1.2,
      "tol": 0.005, "window": 6, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
      "require_breakout_regime_confirmation": True, "market_regime_min_bars": 2},
+    # Controlled 1h LONG exit-management ablation on the fixed N1 entry rules.
+    # These are predeclared causal exits; no entry thresholds are changed.
+    {"name": "N5_1h_long_n1_regime_flip_exit_rr_2_0", "interval": "1h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "require_breakout_regime_confirmation": True, "exit_on_local_regime_flip": True,
+     "exit_on_market_regime_flip": True},
+    {"name": "N6_1h_long_n1_time_stop_12_rr_2_0", "interval": "1h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "require_breakout_regime_confirmation": True, "max_hold_bars": 12},
+    {"name": "N7_1h_long_n1_breakeven_after_0_75R_rr_2_0", "interval": "1h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "require_breakout_regime_confirmation": True, "breakeven_after_R": 0.75},
+    {"name": "N8_1h_long_n1_breakeven_after_1R_rr_2_0", "interval": "1h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "require_breakout_regime_confirmation": True, "breakeven_after_R": 1.0},
     # Controlled 2h ablation: same entry definitions as F21/F22, adding only
     # two completed BTC 4h regime bars at both breakout and retest.
     {"name": "O1_2h_long_btc4h_persistence_2_rr_2_0", "interval": "2h", "margin": 0.006, "volume": 1.2,
@@ -1150,6 +1165,10 @@ async def main():
         "N2_1h_short_local_and_btc4h_rr_2_0_strict",
         "N3_1h_long_btc4h_persistence_2_rr_2_0",
         "N4_1h_short_btc4h_persistence_2_rr_2_0",
+        "N5_1h_long_n1_regime_flip_exit_rr_2_0",
+        "N6_1h_long_n1_time_stop_12_rr_2_0",
+        "N7_1h_long_n1_breakeven_after_0_75R_rr_2_0",
+        "N8_1h_long_n1_breakeven_after_1R_rr_2_0",
         "F7_2h_short_confirmed_by_4h",
         "F8_2h_long_confirmed_by_4h_rr_1_5",
         "F9_2h_long_confirmed_by_4h_rr_2_5",
@@ -1591,6 +1610,10 @@ async def main():
         "N2_1h_short_local_and_btc4h_rr_2_0_strict",
         "N3_1h_long_btc4h_persistence_2_rr_2_0",
         "N4_1h_short_btc4h_persistence_2_rr_2_0",
+        "N5_1h_long_n1_regime_flip_exit_rr_2_0",
+        "N6_1h_long_n1_time_stop_12_rr_2_0",
+        "N7_1h_long_n1_breakeven_after_0_75R_rr_2_0",
+        "N8_1h_long_n1_breakeven_after_1R_rr_2_0",
     }
     leave_one_coin_out = []
     for cfg in CONFIGS:
@@ -1690,6 +1713,10 @@ async def main():
         "N2_1h_short_local_and_btc4h_rr_2_0_strict",
         "N3_1h_long_btc4h_persistence_2_rr_2_0",
         "N4_1h_short_btc4h_persistence_2_rr_2_0",
+        "N5_1h_long_n1_regime_flip_exit_rr_2_0",
+        "N6_1h_long_n1_time_stop_12_rr_2_0",
+        "N7_1h_long_n1_breakeven_after_0_75R_rr_2_0",
+        "N8_1h_long_n1_breakeven_after_1R_rr_2_0",
     }
     bootstrap_uncertainty = []
     for cfg in CONFIGS:
