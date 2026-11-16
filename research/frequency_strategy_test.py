@@ -20,11 +20,11 @@ COINS = [coin for coin in list(bot.COINS) if coin.upper() not in _EXCLUDED_COINS
 if not COINS:
     raise RuntimeError("BT_EXCLUDE_COINS removed every coin from the research universe")
 BASE_TARGET = int(os.getenv("BT_CANDLES", "4000"))
-# 1h was limited to 5,000 candles (~7 months), too short for robust
-# multi-regime validation. Keep 2h/4h at the configured baseline and
-# request a longer 1h history only in this isolated research harness.
+# Use 20,000 1h candles (~2.3 years) to cover more market regimes and
+# align the 1h calendar span with 5,000 4h candles. This applies only to
+# the isolated research harness; production history and bot settings are untouched.
 TARGETS = {
-    "1h": int(os.getenv("BT_CANDLES_1H", str(BASE_TARGET))),
+    "1h": int(os.getenv("BT_CANDLES_1H", "20000")),
     "2h": int(os.getenv("BT_CANDLES_2H", str(BASE_TARGET))),
     "4h": int(os.getenv("BT_CANDLES_4H", str(BASE_TARGET))),
 }
