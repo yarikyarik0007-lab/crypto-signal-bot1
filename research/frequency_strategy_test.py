@@ -1317,6 +1317,67 @@ async def main():
             }
             walk_forward_dense.append(add_cost_stress(dense_row, fold_trades, fold_days))
 
+    # Additional 1h regime-stability check: fixed 6-week forward windows after
+    # a 26-week initial history. Parameters are frozen; every window starts flat,
+    # uses only earlier candles for indicator warm-up, and censors boundary trades.
+    # These windows are diagnostic OOS slices, not a parameter-tuning surface.
+    rolling_walk_forward = []
+    rolling_initial_days = 182
+    rolling_test_days = 42
+    rolling_initial_ms = rolling_initial_days * 86400000
+    rolling_test_ms = rolling_test_days * 86400000
+    for cfg in CONFIGS:
+        if cfg["interval"] != "1h":
+            continue
+        bounds = interval_bounds.get("1h")
+        if not bounds:
+            continue
+        _, evaluation_start, common_end = bounds
+        test_start_utc = evaluation_start + rolling_initial_ms
+        fold_no = 1
+        while test_start_utc + rolling_test_ms <= common_end:
+            test_end_utc = test_start_utc + rolling_test_ms
+            fold_trades = []
+            for coin in COINS:
+                candles = cache.get((coin, "1h"), [])
+                if len(candles) < 500:
+                    continue
+                candle_times = [c["t"] for c in candles]
+                start_idx = bisect.bisect_left(candle_times, test_start_utc)
+                end_idx = bisect.bisect_left(candle_times, test_end_utc)
+                if end_idx <= start_idx + 30:
+                    continue
+                regime_key = (coin, "1h")
+                regimes = regimes_cache[regime_key]
+                htf_regimes = htf_cache.get(regime_key)
+                market_regimes = (
+                    market_regimes_cache.get((coin, "1h", cfg["market_htf"]))
+                    if cfg.get("market_htf") else None
+                )
+                market_regime_age = (
+                    market_regime_age_cache.get((coin, "1h", cfg["market_htf"]))
+                    if cfg.get("market_htf") else None
+                )
+                fold_trades.extend(run_window(
+                    candles, cfg, regimes, htf_regimes,
+                    start_idx=start_idx, end_idx=end_idx,
+                    market_regimes=market_regimes,
+                    market_regime_age=market_regime_age,
+                ))
+            fold_days = max(1, (test_end_utc - test_start_utc) / 86400000)
+            rolling_row = {
+                "config": cfg["name"],
+                "fold": fold_no,
+                "initial_history_days": rolling_initial_days,
+                "test_window_days": rolling_test_days,
+                "test_start_utc": test_start_utc,
+                "test_end_utc": test_end_utc,
+                **metrics(fold_trades, fold_days),
+            }
+            rolling_walk_forward.append(add_cost_stress(rolling_row, fold_trades, fold_days))
+            test_start_utc = test_end_utc
+            fold_no += 1
+
     # Nested, chronological model-selection check. For each interval, choose a
     # predeclared candidate using only earlier walk-forward folds, then score it
     # on the next fold. This is stricter than selecting the best config after
@@ -1781,6 +1842,14 @@ async def main():
         "summary": summaries, "cost_stress": cost_stress,
         "walk_forward": walk_forward, "nested_walk_forward": nested_walk_forward,
         "walk_forward_dense": walk_forward_dense,
+        "rolling_walk_forward": rolling_walk_forward,
+        "rolling_walk_forward_method": {
+            "initial_history_days": rolling_initial_days,
+            "forward_test_window_days": rolling_test_days,
+            "applies_to": "all predeclared 1h configurations",
+            "execution": "flat at each window start; earlier candles used only for causal indicator warm-up; unresolved boundary trades censored",
+            "cost_stress_R_per_trade": [0.05, 0.10, 0.15, 0.20, 0.25],
+        },
         "nested_walk_forward_dense": nested_walk_forward_dense,
         "bootstrap_uncertainty": bootstrap_uncertainty,
         "bootstrap_method": {
@@ -1792,7 +1861,7 @@ async def main():
             "note": "Block-length sensitivity is diagnostic; it does not establish stationarity or future profitability.",
         },
         "leave_one_coin_out": leave_one_coin_out, "per_coin": all_rows, "errors": errors,
-        "warning": "Research only. The 1h interval uses a research-only backward paginator and can request up to 10,000 candles; 2h/4h retain their configured targets. Actual per-coin candle counts are recorded above. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. Cost stress is checked through +0.25R per trade with monotonicity assertions. When BT_BOUNDS_REFERENCE is set, evaluation_start and evaluation_end are anchored to that reference run for an apples-to-apples universe comparison; an unanchored no-ZEC run separately measures the longer-history effect. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.15R/trade stress using trade-level gross profit/loss aggregation. An additional seven-window sequential walk-forward and nested selection require positive stressed results in every prior selection window. Break-even variants activate only after a candle close and use the next candle onward. Additional +0.15R stress and leave-one-coin-out checks are included. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
+        "warning": "Research only. The 1h interval uses a research-only backward paginator and can request up to 20,000 candles; 2h/4h retain their configured targets. Actual per-coin candle counts are recorded above. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. Cost stress is checked through +0.25R per trade with monotonicity assertions. When BT_BOUNDS_REFERENCE is set, evaluation_start and evaluation_end are anchored to that reference run for an apples-to-apples universe comparison; an unanchored no-ZEC run separately measures the longer-history effect. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.15R/trade stress using trade-level gross profit/loss aggregation. An additional seven-window sequential walk-forward and nested selection require positive stressed results in every prior selection window. All 1h configurations also receive fixed-parameter rolling 42-day OOS windows after a 182-day initial history. Break-even variants activate only after a candle close and use the next candle onward. Additional +0.15R stress and leave-one-coin-out checks are included. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
     }
     (OUT / "summary.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({"summary": summaries, "errors": errors}, indent=2))
