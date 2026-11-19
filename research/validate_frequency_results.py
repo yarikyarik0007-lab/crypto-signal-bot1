@@ -22,6 +22,8 @@ BOOTSTRAP_COST = 0.15
 ROLLING_INITIAL_DAYS = 182
 ROLLING_TEST_DAYS = 42
 MIN_ROLLING_TEST_TRADES = 8
+ROLLING_21D_TEST_DAYS = 21
+MIN_ROLLING_21D_TEST_TRADES = 4
 OUT = Path("frequency-gate")
 OUT.mkdir(parents=True, exist_ok=True)
 
@@ -92,6 +94,25 @@ def diagnostic_coverage(config, loaded):
                     f"found {len(rolling_rows)}"
                 )
 
+            expected_21d = max(
+                0,
+                (evaluation_end - evaluation_start - ROLLING_INITIAL_DAYS * 86400000)
+                // (ROLLING_21D_TEST_DAYS * 86400000),
+            )
+            rolling_21d_rows = [
+                row for row in summary.get("rolling_21d_walk_forward", [])
+                if row.get("config") == config
+            ]
+            rolling_21d_folds = {int(row.get("fold", -1)) for row in rolling_21d_rows}
+            if (
+                len(rolling_21d_rows) != expected_21d
+                or rolling_21d_folds != set(range(1, expected_21d + 1))
+            ):
+                issues.append(
+                    f"rolling_21d_walk_forward: expected {expected_21d} complete 1h OOS windows, "
+                    f"found {len(rolling_21d_rows)}"
+                )
+
         boot_rows = [
             row for row in summary.get("bootstrap_uncertainty", [])
             if row.get("config") == config
@@ -149,9 +170,11 @@ def evaluate_config(config, loaded):
     }
     if config_interval == "1h":
         checks["rolling_six_week_walk_forward"] = True
+        checks["rolling_three_week_walk_forward"] = True
     observed = {
         "datasets": {}, "walk_forward": {}, "bootstrap": {},
         "leave_one_coin_out": {}, "rolling_walk_forward": {},
+        "rolling_21d_walk_forward": {},
     }
 
     for dataset_name, summary in loaded.items():
@@ -281,6 +304,64 @@ def evaluate_config(config, loaded):
                     )
                     checks["rolling_six_week_walk_forward"] = False
             observed["rolling_walk_forward"][dataset_name] = rolling_details
+
+            rolling_21d_rows = sorted(
+                [
+                    row for row in summary.get("rolling_21d_walk_forward", [])
+                    if row.get("config") == config
+                ],
+                key=lambda row: int(row.get("fold", 0)),
+            )
+            rolling_21d_details = []
+            bounds = summary.get("calendar_windows", {}).get("1h", {})
+            evaluation_start = int(bounds.get("evaluation_start_utc", 0))
+            evaluation_end = int(bounds.get("evaluation_end_utc", 0))
+            expected_21d = max(
+                0,
+                (evaluation_end - evaluation_start - ROLLING_INITIAL_DAYS * 86400000)
+                // (ROLLING_21D_TEST_DAYS * 86400000),
+            )
+            if len(rolling_21d_rows) != expected_21d:
+                failures.append(
+                    f"{dataset_name}/rolling_21d_walk_forward: expected {expected_21d} windows, "
+                    f"found {len(rolling_21d_rows)}"
+                )
+                checks["rolling_three_week_walk_forward"] = False
+            for row in rolling_21d_rows:
+                trades = int(row.get("trades", 0))
+                net_015 = float(row.get("net_R_after_extra_0.15R", 0.0))
+                pf_015 = float(row.get("PF_after_extra_0.15R", 0.0))
+                net_020 = float(row.get("net_R_after_extra_0.20R", 0.0))
+                pf_020 = float(row.get("PF_after_extra_0.20R", 0.0))
+                detail = {
+                    "fold": int(row.get("fold", 0)),
+                    "test_start_utc": row.get("test_start_utc"),
+                    "test_end_utc": row.get("test_end_utc"),
+                    "trades": trades,
+                    "win_rate_pct": row.get("win_rate_pct"),
+                    "profit_factor": row.get("profit_factor"),
+                    "net_R": row.get("net_R"),
+                    "max_drawdown_R": row.get("max_drawdown_R"),
+                    "net_R_after_0.15R": net_015,
+                    "PF_after_0.15R": pf_015,
+                    "net_R_after_0.20R": net_020,
+                    "PF_after_0.20R": pf_020,
+                    "net_R_after_0.25R": row.get("net_R_after_extra_0.25R"),
+                    "PF_after_0.25R": row.get("PF_after_extra_0.25R"),
+                }
+                rolling_21d_details.append(detail)
+                if (
+                    trades < MIN_ROLLING_21D_TEST_TRADES
+                    or net_015 <= 0 or pf_015 <= 1.0
+                    or net_020 <= 0 or pf_020 <= 1.0
+                ):
+                    failures.append(
+                        f"{dataset_name}/rolling_21d_walk_forward/fold-{detail['fold']}: "
+                        f"trades={trades}, +0.15R Net/PF={net_015:.3f}/{pf_015:.3f}, "
+                        f"+0.20R Net/PF={net_020:.3f}/{pf_020:.3f}"
+                    )
+                    checks["rolling_three_week_walk_forward"] = False
+            observed["rolling_21d_walk_forward"][dataset_name] = rolling_21d_details
 
         boot_rows = [
             row for row in summary.get("bootstrap_uncertainty", [])
@@ -498,6 +579,13 @@ def main():
                 "require_positive_net_R_and_PF_above_1_after_costs": [0.15, 0.20],
                 "all_windows_must_pass": True,
             },
+            "rolling_21d_walk_forward_1h": {
+                "initial_history_days": ROLLING_INITIAL_DAYS,
+                "forward_test_window_days": ROLLING_21D_TEST_DAYS,
+                "minimum_trades_per_test_window": MIN_ROLLING_21D_TEST_TRADES,
+                "require_positive_net_R_and_PF_above_1_after_costs": [0.15, 0.20],
+                "all_windows_must_pass": True,
+            },
             "bootstrap": {
                 "cost_R_per_trade": BOOTSTRAP_COST,
                 "block_lengths_weeks": list(BOOTSTRAP_BLOCKS),
@@ -527,7 +615,7 @@ def main():
         "passed_candidates": passed,
         "status": status,
         "coverage_note": (
-            "Only configurations with complete cost-stress, 5/7 walk-forward and rolling 1h windows where applicable, "
+            "Only configurations with complete cost-stress, 5/7 walk-forward, 42-day and 21-day rolling 1h windows where applicable, "
             "bootstrap and per-coin holdout diagnostics are evaluated as candidates. "
             "Chronological nested model-selection must also pass standard and dense "
             "out-of-sample folds across all datasets. Other configurations are marked "
