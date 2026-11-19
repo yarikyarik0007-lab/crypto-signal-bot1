@@ -249,6 +249,20 @@ CONFIGS = [
     {"name": "O2_2h_long_local_and_btc4h_persistence_2_rr_2_0", "interval": "2h", "margin": 0.006, "volume": 1.2,
      "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
      "market_regime_min_bars": 2},
+    # Conservative execution sensitivity: identical N1-N4 entries, but a stop crossed
+    # at candle open is filled at that open rather than optimistically at the stop.
+    {"name": "P1_1h_long_n1_gap_aware_stop_rr_2_0", "interval": "1h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "require_breakout_regime_confirmation": True, "gap_aware_stop": True},
+    {"name": "P2_1h_short_n2_gap_aware_stop_rr_2_0", "interval": "1h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "require_breakout_regime_confirmation": True, "gap_aware_stop": True},
+    {"name": "P3_1h_long_n3_persistence_gap_aware_stop_rr_2_0", "interval": "1h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "long_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "require_breakout_regime_confirmation": True, "market_regime_min_bars": 2, "gap_aware_stop": True},
+    {"name": "P4_1h_short_n4_persistence_gap_aware_stop_rr_2_0", "interval": "1h", "margin": 0.006, "volume": 1.2,
+     "tol": 0.005, "window": 6, "mode": "short_dual_market_htf", "market_htf": "4h", "rr_target": 2.0,
+     "require_breakout_regime_confirmation": True, "market_regime_min_bars": 2, "gap_aware_stop": True},
 ]
 
 
@@ -365,6 +379,7 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
                 continue
 
             exit_r, exit_i, exit_reason = None, None, None
+            exit_price = None
             breakeven_after_r = cfg.get("breakeven_after_R")
             breakeven_active = False
             # Crucially, never inspect candles beyond this evaluation window.
@@ -372,17 +387,41 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
                 c = candles[k]
                 active_sl = entry if breakeven_active else sl
                 if direction == "LONG":
+                    open_hit_sl, open_hit_tp = c["o"] <= active_sl, c["o"] >= tp
                     hit_sl, hit_tp = c["l"] <= active_sl, c["h"] >= tp
                 else:
+                    open_hit_sl, open_hit_tp = c["o"] >= active_sl, c["o"] <= tp
                     hit_sl, hit_tp = c["h"] >= active_sl, c["l"] <= tp
+
+                # Optional conservative gap execution. A resting target is credited
+                # only at its limit; a stop-market order crossed at the open is filled
+                # at the worse opening price. If no opening gap exists, retain the
+                # conservative intrabar stop-first tie-break below.
+                if cfg.get("gap_aware_stop") and open_hit_tp:
+                    exit_price = tp
+                    exit_r, exit_i, exit_reason = rr_target, k, "target_gap"
+                    break
+                if cfg.get("gap_aware_stop") and open_hit_sl:
+                    exit_price = c["o"]
+                    exit_r = (
+                        (exit_price - entry) / risk
+                        if direction == "LONG"
+                        else (entry - exit_price) / risk
+                    )
+                    exit_i = k
+                    exit_reason = "gap_breakeven" if breakeven_active else "gap_stop"
+                    break
+
                 # Conservative tie-break: if stop and target hit in one candle,
                 # assume the active stop was hit first.
                 if hit_sl:
+                    exit_price = active_sl
                     exit_r = 0.0 if breakeven_active else -1.0
                     exit_i = k
                     exit_reason = "breakeven" if breakeven_active else "stop"
                     break
                 if hit_tp:
+                    exit_price = tp
                     exit_r, exit_i, exit_reason = rr_target, k, "target"
                     break
                 # Arm breakeven only after a completed candle closes beyond the
@@ -445,13 +484,19 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
             if censored:
                 exit_i, exit_reason = end_idx - 1, "censored_window_end"
                 trade_r = None
+                exit_price = None
             else:
                 exit_r -= bot.BT_FEE_R
                 trade_r = round(exit_r, 4)
             trades.append({
                 "direction": direction, "entry_i": i + 1, "exit_i": exit_i,
                 "entry_time": candles[i + 1].get("t"), "exit_time": candles[exit_i].get("t"),
+                "entry_price": round(entry, 12), "risk_distance": round(risk, 12),
+                "risk_pct": round(100 * risk / entry, 6) if entry else None,
+                "exit_price": round(exit_price, 12) if exit_price is not None else None,
                 "r": trade_r, "exit_reason": exit_reason, "regime": regime,
+                "market_regime": market_regime,
+                "breakout_market_regime": triggered.get("breakout_market_regime"),
                 "bars_held": max(1, exit_i - (i + 1) + (0 if exit_reason in {"time_stop", "regime_flip"} else 1)) if exit_i is not None else None,
                 "censored": censored,
             })
@@ -1169,6 +1214,10 @@ async def main():
         "N6_1h_long_n1_time_stop_12_rr_2_0",
         "N7_1h_long_n1_breakeven_after_0_75R_rr_2_0",
         "N8_1h_long_n1_breakeven_after_1R_rr_2_0",
+        "P1_1h_long_n1_gap_aware_stop_rr_2_0",
+        "P2_1h_short_n2_gap_aware_stop_rr_2_0",
+        "P3_1h_long_n3_persistence_gap_aware_stop_rr_2_0",
+        "P4_1h_short_n4_persistence_gap_aware_stop_rr_2_0",
         "F7_2h_short_confirmed_by_4h",
         "F8_2h_long_confirmed_by_4h_rr_1_5",
         "F9_2h_long_confirmed_by_4h_rr_2_5",
@@ -1375,6 +1424,62 @@ async def main():
                 **metrics(fold_trades, fold_days),
             }
             rolling_walk_forward.append(add_cost_stress(rolling_row, fold_trades, fold_days))
+            test_start_utc = test_end_utc
+            fold_no += 1
+
+    # Additional shorter 21-day OOS windows detect short-lived regime dependence
+    # that can be hidden by six-week aggregation. Parameters remain fixed and every
+    # window starts flat after the same 182-day causal warm-up.
+    rolling_21d_walk_forward = []
+    rolling_21d_test_days = 21
+    rolling_21d_test_ms = rolling_21d_test_days * 86400000
+    for cfg in CONFIGS:
+        if cfg["interval"] != "1h":
+            continue
+        bounds = interval_bounds.get("1h")
+        if not bounds:
+            continue
+        _, evaluation_start, common_end = bounds
+        test_start_utc = evaluation_start + rolling_initial_ms
+        fold_no = 1
+        while test_start_utc + rolling_21d_test_ms <= common_end:
+            test_end_utc = test_start_utc + rolling_21d_test_ms
+            fold_trades = []
+            for coin in COINS:
+                candles = cache.get((coin, "1h"), [])
+                if len(candles) < 500:
+                    continue
+                candle_times = [c["t"] for c in candles]
+                start_idx = bisect.bisect_left(candle_times, test_start_utc)
+                end_idx = bisect.bisect_left(candle_times, test_end_utc)
+                if end_idx <= start_idx + 30:
+                    continue
+                regime_key = (coin, "1h")
+                regimes = regimes_cache[regime_key]
+                htf_regimes = htf_cache.get(regime_key)
+                market_regimes = (
+                    market_regimes_cache.get((coin, "1h", cfg["market_htf"]))
+                    if cfg.get("market_htf") else None
+                )
+                market_regime_age = (
+                    market_regime_age_cache.get((coin, "1h", cfg["market_htf"]))
+                    if cfg.get("market_htf") else None
+                )
+                fold_trades.extend(run_window(
+                    candles, cfg, regimes, htf_regimes,
+                    start_idx=start_idx, end_idx=end_idx,
+                    market_regimes=market_regimes,
+                    market_regime_age=market_regime_age,
+                ))
+            fold_days = max(1, (test_end_utc - test_start_utc) / 86400000)
+            rolling_21d_row = {
+                "config": cfg["name"], "fold": fold_no,
+                "initial_history_days": rolling_initial_days,
+                "test_window_days": rolling_21d_test_days,
+                "test_start_utc": test_start_utc, "test_end_utc": test_end_utc,
+                **metrics(fold_trades, fold_days),
+            }
+            rolling_21d_walk_forward.append(add_cost_stress(rolling_21d_row, fold_trades, fold_days))
             test_start_utc = test_end_utc
             fold_no += 1
 
@@ -1850,6 +1955,14 @@ async def main():
             "execution": "flat at each window start; earlier candles used only for causal indicator warm-up; unresolved boundary trades censored",
             "cost_stress_R_per_trade": [0.05, 0.10, 0.15, 0.20, 0.25],
         },
+        "rolling_21d_walk_forward": rolling_21d_walk_forward,
+        "rolling_21d_walk_forward_method": {
+            "initial_history_days": rolling_initial_days,
+            "forward_test_window_days": rolling_21d_test_days,
+            "applies_to": "all predeclared 1h configurations",
+            "execution": "flat at each window start; earlier candles used only for causal indicator warm-up; unresolved boundary trades censored",
+            "cost_stress_R_per_trade": [0.05, 0.10, 0.15, 0.20, 0.25],
+        },
         "nested_walk_forward_dense": nested_walk_forward_dense,
         "bootstrap_uncertainty": bootstrap_uncertainty,
         "bootstrap_method": {
@@ -1861,7 +1974,7 @@ async def main():
             "note": "Block-length sensitivity is diagnostic; it does not establish stationarity or future profitability.",
         },
         "leave_one_coin_out": leave_one_coin_out, "per_coin": all_rows, "errors": errors,
-        "warning": "Research only. The 1h interval uses a research-only backward paginator and can request up to 20,000 candles; 2h/4h retain their configured targets. Actual per-coin candle counts are recorded above. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. Cost stress is checked through +0.25R per trade with monotonicity assertions. When BT_BOUNDS_REFERENCE is set, evaluation_start and evaluation_end are anchored to that reference run for an apples-to-apples universe comparison; an unanchored no-ZEC run separately measures the longer-history effect. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.15R/trade stress using trade-level gross profit/loss aggregation. An additional seven-window sequential walk-forward and nested selection require positive stressed results in every prior selection window. All 1h configurations also receive fixed-parameter rolling 42-day OOS windows after a 182-day initial history. Break-even variants activate only after a candle close and use the next candle onward. Additional +0.15R stress and leave-one-coin-out checks are included. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
+        "warning": "Research only. The 1h interval uses a research-only backward paginator and can request up to 20,000 candles; 2h/4h retain their configured targets. Actual per-coin candle counts are recorded above. Train/holdout and five walk-forward folds use common UTC calendar boundaries per interval. Cost stress is checked through +0.25R per trade with monotonicity assertions. When BT_BOUNDS_REFERENCE is set, evaluation_start and evaluation_end are anchored to that reference run for an apples-to-apples universe comparison; an unanchored no-ZEC run separately measures the longer-history effect. Fold positions are reset and unresolved trades are censored. Nested selection uses only prior folds and ranks candidates after +0.15R/trade stress using trade-level gross profit/loss aggregation. An additional seven-window sequential walk-forward and nested selection require positive stressed results in every prior selection window. All 1h configurations also receive fixed-parameter rolling 42-day and 21-day OOS windows after a 182-day initial history. Gap-aware variants fill stop-market gaps at the next candle open and do not assume stop-price fills through gaps. Break-even variants activate only after a candle close and use the next candle onward. Additional +0.15R stress and leave-one-coin-out checks are included. Signals/day is across the tested coin-universe, not a promise. No production settings were changed.",
     }
     (OUT / "summary.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({"summary": summaries, "errors": errors}, indent=2))
