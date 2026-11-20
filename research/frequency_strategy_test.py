@@ -488,9 +488,14 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
             else:
                 exit_r -= bot.BT_FEE_R
                 trade_r = round(exit_r, 4)
+            interval_ms = {"1h": 3600000, "2h": 7200000, "4h": 14400000}[cfg["interval"]]
+            exposure_end_time = int(candles[exit_i]["t"])
+            if exit_reason in {"stop", "target", "breakeven", "censored_window_end"}:
+                exposure_end_time += interval_ms
             trades.append({
                 "direction": direction, "entry_i": i + 1, "exit_i": exit_i,
                 "entry_time": candles[i + 1].get("t"), "exit_time": candles[exit_i].get("t"),
+                "exposure_end_time": exposure_end_time,
                 "entry_price": round(entry, 12), "risk_distance": round(risk, 12),
                 "risk_pct": round(100 * risk / entry, 6) if entry else None,
                 "exit_price": round(exit_price, 12) if exit_price is not None else None,
@@ -525,6 +530,81 @@ def run_window(candles, cfg, regimes=None, htf_regimes=None, start_idx=0, end_id
                                 "breakout_market_regime_age": market_regime_age[i] if market_regime_age is not None else 0})
         i += 1
     return trades
+
+
+def concurrent_exposure_metrics(trades, days):
+    """Conservative portfolio overlap diagnostics using entry-to-exposure-end intervals.
+
+    Intrabar stop/target exits are held through the end of their candle because the
+    exact fill time is unknown. Same-timestamp entries are processed before exits,
+    so peak concurrency does not understate boundary overlap. Censored trades remain
+    open through the final candle for exposure accounting, but never enter PnL.
+    """
+    events = []
+    for trade in trades:
+        start = trade.get("entry_time")
+        end = trade.get("exposure_end_time", trade.get("exit_time"))
+        if start is None or end is None:
+            continue
+        start, end = int(start), int(end)
+        if end < start:
+            continue
+        direction = trade.get("direction")
+        events.append((start, 1, direction))
+        events.append((end, -1, direction))
+
+    # Entries before exits at equal timestamps is intentionally conservative.
+    events.sort(key=lambda event: (event[0], -event[1]))
+    open_total = open_longs = open_shorts = 0
+    peak_total = peak_longs = peak_shorts = 0
+    occupied_ms = 0
+    previous_time = None
+
+    for timestamp, delta, direction in events:
+        if previous_time is not None and timestamp > previous_time:
+            occupied_ms += open_total * (timestamp - previous_time)
+        if delta > 0:
+            open_total += 1
+            if direction == "LONG":
+                open_longs += 1
+            elif direction == "SHORT":
+                open_shorts += 1
+        else:
+            open_total = max(0, open_total - 1)
+            if direction == "LONG":
+                open_longs = max(0, open_longs - 1)
+            elif direction == "SHORT":
+                open_shorts = max(0, open_shorts - 1)
+        peak_total = max(peak_total, open_total)
+        peak_longs = max(peak_longs, open_longs)
+        peak_shorts = max(peak_shorts, open_shorts)
+        previous_time = timestamp
+
+    period_ms = max(0.0, float(days)) * 86400000
+    return {
+        "max_concurrent_positions": peak_total,
+        "max_concurrent_longs": peak_longs,
+        "max_concurrent_shorts": peak_shorts,
+        "avg_concurrent_positions": round(occupied_ms / period_ms, 3) if period_ms > 0 else 0.0,
+        "position_hours": round(occupied_ms / 3600000, 3),
+    }
+
+
+def validate_concurrency_metrics():
+    """Small deterministic check for overlap, same-time ties and direction counts."""
+    sample = [
+        {"entry_time": 0, "exit_time": 10, "direction": "LONG"},
+        {"entry_time": 5, "exit_time": 15, "direction": "SHORT"},
+        {"entry_time": 10, "exit_time": 20, "direction": "LONG"},
+    ]
+    result = concurrent_exposure_metrics(sample, days=1)
+    if (
+        result["max_concurrent_positions"] != 3
+        or result["max_concurrent_longs"] != 2
+        or result["max_concurrent_shorts"] != 1
+        or result["position_hours"] <= 0
+    ):
+        raise RuntimeError(f"Concurrent exposure self-check failed: {result}")
 
 
 def metrics(trades, days, extra_cost_r=0.0):
@@ -570,6 +650,7 @@ def metrics(trades, days, extra_cost_r=0.0):
         ),
         "max_drawdown_R": round(max_dd, 3),
         "signals_per_day": round(len(rs) / days, 3) if days > 0 else 0,
+        **concurrent_exposure_metrics(trades, days),
     }
 
 
@@ -922,6 +1003,7 @@ def validated_fast_regimes(candles):
 
 
 async def main():
+    validate_concurrency_metrics()
     errors, results, all_rows = [], [], []
     regimes_cache = {}
     htf_cache = {}
@@ -1607,6 +1689,8 @@ async def main():
                 "test_net_R_after_extra_0.25R": test_row["net_R_after_extra_0.25R"],
                 "test_PF_after_extra_0.25R": test_row["PF_after_extra_0.25R"],
                 "test_max_drawdown_R": test_row["max_drawdown_R"],
+                "test_max_concurrent_positions": test_row.get("max_concurrent_positions"),
+                "test_avg_concurrent_positions": test_row.get("avg_concurrent_positions"),
                 "status": "evaluated",
             })
 
@@ -1704,6 +1788,8 @@ async def main():
                 "test_net_R_after_extra_0.25R": test_row["net_R_after_extra_0.25R"],
                 "test_PF_after_extra_0.25R": test_row["PF_after_extra_0.25R"],
                 "test_max_drawdown_R": test_row["max_drawdown_R"],
+                "test_max_concurrent_positions": test_row.get("max_concurrent_positions"),
+                "test_avg_concurrent_positions": test_row.get("avg_concurrent_positions"),
                 "status": "evaluated",
             })
 
@@ -1965,6 +2051,14 @@ async def main():
         },
         "nested_walk_forward_dense": nested_walk_forward_dense,
         "bootstrap_uncertainty": bootstrap_uncertainty,
+        "concurrent_exposure_method": {
+            "position_interval": "entry_time to exposure_end_time",
+            "intrabar_stop_target_exit": "conservatively held through the exit candle close",
+            "censored_trade": "counted as open through the final candle for exposure only",
+            "same_timestamp_tie": "entries processed before exits to avoid understating peak overlap",
+            "metrics": ["max_concurrent_positions", "max_concurrent_longs", "max_concurrent_shorts", "avg_concurrent_positions", "position_hours"],
+            "note": "Exposure diagnostics are not a position-sizing recommendation and do not alter trade PnL.",
+        },
         "bootstrap_method": {
             "resampling_unit": "weekly portfolio returns pooled across coins",
             "block_lengths_weeks": [2, 4, 8],
