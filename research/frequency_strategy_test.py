@@ -592,10 +592,11 @@ def concurrent_exposure_metrics(trades, days):
 
 def validate_concurrency_metrics():
     """Small deterministic check for overlap, same-time ties and direction counts."""
+    hour_ms = 3600000
     sample = [
-        {"entry_time": 0, "exit_time": 10, "direction": "LONG"},
-        {"entry_time": 5, "exit_time": 15, "direction": "SHORT"},
-        {"entry_time": 10, "exit_time": 20, "direction": "LONG"},
+        {"entry_time": 0, "exit_time": 10 * hour_ms, "direction": "LONG"},
+        {"entry_time": 5 * hour_ms, "exit_time": 15 * hour_ms, "direction": "SHORT"},
+        {"entry_time": 10 * hour_ms, "exit_time": 20 * hour_ms, "direction": "LONG"},
     ]
     result = concurrent_exposure_metrics(sample, days=1)
     if (
