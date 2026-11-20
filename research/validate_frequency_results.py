@@ -62,8 +62,11 @@ def diagnostic_coverage(config, loaded):
 
         for period in ("train", "holdout"):
             for cost in REQUIRED_COSTS:
-                if cost_row(summary, config, period, cost) is None:
+                row = cost_row(summary, config, period, cost)
+                if row is None:
                     issues.append(f"missing unique cost-stress row: {period} +{cost:.2f}R")
+                elif row.get("max_concurrent_positions") is None or row.get("avg_concurrent_positions") is None:
+                    issues.append(f"missing concurrent-exposure diagnostics: {period} +{cost:.2f}R")
 
         for field, expected in (("walk_forward", 5), ("walk_forward_dense", 7)):
             count = len(aggregate_fold_rows(summary, field, config))
@@ -206,6 +209,11 @@ def evaluate_config(config, loaded):
                     "profit_factor": pf,
                     "net_R": net_r,
                     "max_drawdown_R": row.get("max_drawdown_R"),
+                    "max_concurrent_positions": row.get("max_concurrent_positions"),
+                    "max_concurrent_longs": row.get("max_concurrent_longs"),
+                    "max_concurrent_shorts": row.get("max_concurrent_shorts"),
+                    "avg_concurrent_positions": row.get("avg_concurrent_positions"),
+                    "position_hours": row.get("position_hours"),
                 }
                 if trades < MIN_PERIOD_TRADES:
                     failures.append(
@@ -227,6 +235,8 @@ def evaluate_config(config, loaded):
                     "profit_factor": harsh.get("profit_factor"),
                     "net_R": harsh.get("net_R"),
                     "max_drawdown_R": harsh.get("max_drawdown_R"),
+                    "max_concurrent_positions": harsh.get("max_concurrent_positions"),
+                    "avg_concurrent_positions": harsh.get("avg_concurrent_positions"),
                 }
             dataset_result[period] = period_result
         observed["datasets"][dataset_name] = dataset_result
@@ -251,6 +261,9 @@ def evaluate_config(config, loaded):
                     "profit_factor_after_0.15R": pf,
                     "net_R_after_0.15R": net_r,
                     "max_drawdown_R_after_0.15R": row.get("max_drawdown_R_after_extra_0.15R"),
+                    "max_concurrent_positions": row.get("max_concurrent_positions"),
+                    "avg_concurrent_positions": row.get("avg_concurrent_positions"),
+                    "position_hours": row.get("position_hours"),
                 })
                 if trades < MIN_FOLD_TRADES or net_r <= 0 or pf <= 1.0:
                     failures.append(
@@ -284,6 +297,11 @@ def evaluate_config(config, loaded):
                     "profit_factor": row.get("profit_factor"),
                     "net_R": row.get("net_R"),
                     "max_drawdown_R": row.get("max_drawdown_R"),
+                    "max_concurrent_positions": row.get("max_concurrent_positions"),
+                    "max_concurrent_longs": row.get("max_concurrent_longs"),
+                    "max_concurrent_shorts": row.get("max_concurrent_shorts"),
+                    "avg_concurrent_positions": row.get("avg_concurrent_positions"),
+                    "position_hours": row.get("position_hours"),
                     "net_R_after_0.15R": net_015,
                     "PF_after_0.15R": pf_015,
                     "net_R_after_0.20R": net_020,
@@ -342,6 +360,11 @@ def evaluate_config(config, loaded):
                     "profit_factor": row.get("profit_factor"),
                     "net_R": row.get("net_R"),
                     "max_drawdown_R": row.get("max_drawdown_R"),
+                    "max_concurrent_positions": row.get("max_concurrent_positions"),
+                    "max_concurrent_longs": row.get("max_concurrent_longs"),
+                    "max_concurrent_shorts": row.get("max_concurrent_shorts"),
+                    "avg_concurrent_positions": row.get("avg_concurrent_positions"),
+                    "position_hours": row.get("position_hours"),
                     "net_R_after_0.15R": net_015,
                     "PF_after_0.15R": pf_015,
                     "net_R_after_0.20R": net_020,
@@ -468,6 +491,8 @@ def evaluate_nested_selection(summary, field, minimum_evaluated_folds):
             "PF_after_0.15R": pf_015,
             "net_R_after_0.20R": net_020,
             "PF_after_0.20R": pf_020,
+            "max_concurrent_positions": row.get("test_max_concurrent_positions"),
+            "avg_concurrent_positions": row.get("test_avg_concurrent_positions"),
         }
         observed.append(item)
         if trades < MIN_FOLD_TRADES:
